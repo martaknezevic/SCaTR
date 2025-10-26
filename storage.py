@@ -19,28 +19,28 @@ class ChoiceStorage:
         """Serialize a choice object to a dictionary"""
         result = {
             'message': {
-                'content': choice.message.content,
-                'role': choice.message.role
+                'content': choice['message']['content'],
+                'role': choice['message']['role']
             },
-            'finish_reason': choice.finish_reason,
-            'index': choice.index,
+            'finish_reason': choice['finish_reason'],
+            'index': choice['index'],
         }
         
         # Store logprobs if available
-        if hasattr(choice, 'logprobs') and choice.logprobs:
+        if hasattr(choice, 'logprobs') and choice['logprobs']:
             logprobs_data = []
-            for token_data in choice.logprobs.content:
+            for token_data in choice['logprobs']['content']:
                 token_info = {
-                    'token': token_data.token,
-                    'logprob': token_data.logprob,
+                    'token': token_data['token'],
+                    'logprob': token_data['logprob'],
                     'top_logprobs': []
                 }
                 
-                if token_data.top_logprobs:
-                    for top_lp in token_data.top_logprobs:
+                if token_data['top_logprobs']:
+                    for top_lp in token_data['top_logprobs']:
                         token_info['top_logprobs'].append({
-                            'token': top_lp.token,
-                            'logprob': top_lp.logprob,
+                            'token': top_lp['token'],
+                            'logprob': top_lp['logprob'],
                         })
                 
                 logprobs_data.append(token_info)

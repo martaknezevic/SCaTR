@@ -3,7 +3,7 @@ Confidence metrics computation module.
 Easy to extend with new metrics.
 """
 import numpy as np
-from typing import List, Dict, Any, Callable
+from typing import List, Dict, Any, Callable, Optional
 from dataclasses import dataclass
 from utils import _get_topk_probs, _get_topk_probs_np
 import math
@@ -14,6 +14,7 @@ class MetricConfig:
     name: str
     compute_fn: Callable[[List[Any]], List[float]]
     description: str = ""
+    uses_k: bool = False
 
 
 class ConfidenceMetrics:
@@ -28,72 +29,86 @@ class ConfidenceMetrics:
             'mean': MetricConfig(
                 name='mean',
                 compute_fn=self._compute_mean_confidence,
-                description='Negative mean of top-k logprobs'
+                description='Negative mean of top-k logprobs',
+                uses_k=True
             ),
             'median': MetricConfig(
                 name='median',
                 compute_fn=self._compute_median_confidence,
-                description='Negative median of top-k logprobs'
+                description='Negative median of top-k logprobs',
+                uses_k=True
             ),
             'variance': MetricConfig(
                 name='variance',
                 compute_fn=self._compute_variance_confidence,
-                description='Variance of top-k logprobs'
+                description='Variance of top-k logprobs',
+                uses_k=True
             ),
             'gap': MetricConfig(
                 name='gap',
                 compute_fn=self._compute_gap_confidence,
-                description='Gap between top-1 and top-2 logprobs'
+                description='Gap between top-1 and top-2 logprobs',
+                uses_k=False
             ),
             #'exp_mean': MetricConfig(
             #    name='exp_mean',
             #    compute_fn=self._compute_exp_mean_confidence,
             #    description='Exponential of mean (geometric mean in prob space)'
+            #    uses_k=True
             #),
             #'distinctiveness': MetricConfig(
             #    name='distinctiveness',
             #    compute_fn=self._compute_distinctiveness_confidence,
-            #    description='Z-score normalized difference between top-1 and mean of others'
+            #    description='Z-score normalized difference between top-1 and mean of others',
+            #    uses_k=True
             #),
             #'top_prob': MetricConfig(
             #    name='top_prob',
             #    compute_fn=self._compute_top_prob_confidence,
-            #    description='Top-1 probability'
+            #    description='Top-1 probability',
+            #    uses_k=False
             #),
             'entropy': MetricConfig(
                 name='entropy',
                 compute_fn=self._compute_entropy_uncertainty,
-                description='Normalized Entropy of top-k distribution (Higher = Higher Uncertainty)'
+                description='Normalized Entropy of top-k distribution (Higher = Higher Uncertainty)',
+                uses_k=True
             ),
             #'perplexity': MetricConfig(
             #    name='perplexity',
             #    compute_fn=self._compute_perplexity_uncertainty,
-            #    description='Perplexity of top-k distribution (Higher = Higher Uncertainty)'
+            #    description='Perplexity of top-k distribution (Higher = Higher Uncertainty)',
+            #    uses_k=True
             #),
             #'kl_divergence': MetricConfig(
             #    name='kl_divergence',
             #    compute_fn=self._compute_kl_divergence_confidence,
-            #    description='KL Divergence from top-k distribution to uniform (Higher = Higher Confidence)'
+            #    description='KL Divergence from top-k distribution to uniform (Higher = Higher Confidence)',
+            #    uses_k=True
             #),
             #'renyi_divergence': MetricConfig(
             #    name='renyi_divergence',
             #    compute_fn=self._compute_renyi_divergence_uncertainty,
-            #    description='Rényi Divergence (alpha=2) from top-k distribution to uniform (Higher = Higher Uncertainty)'
+            #    description='Rényi Divergence (alpha=2) from top-k distribution to uniform (Higher = Higher Uncertainty)',
+            #    uses_k=True
             #),
             #'fisher_rao_distance': MetricConfig(
             #    name='fisher_rao_distance',
             #    compute_fn=self._compute_fisher_rao_distance_uncertainty,
-            #    description='Fisher-Rao Distance from top-k distribution to uniform (Higher = Higher Uncertainty)'
+            #    description='Fisher-Rao Distance from top-k distribution to uniform (Higher = Higher Uncertainty)',
+            #    uses_k=True
             #),
             #'inverse_probability': MetricConfig(
             #    name='inverse_probability',
             #    compute_fn=self.compute_inverse_probability_uncertainty,
-            #    description='Inverse Probability using sampled token logprobs (Higher = Higher Uncertainty)'
+            #    description='Inverse Probability using sampled token logprobs (Higher = Higher Uncertainty)',
+            #    uses_k=False
             #),
             'gap_probs': MetricConfig(
                 name='gap_probs',
                 compute_fn=self._compute_gap_probs_confidence,
-                description='Gap between top-1 and top-2 probabilities (Higher = Higher Confidence)'
+                description='Gap between top-1 and top-2 probabilities (Higher = Higher Confidence)',
+                uses_k=False
             ),
         }
     
@@ -101,48 +116,57 @@ class ConfidenceMetrics:
         """Add a new metric dynamically"""
         self.metrics[metric_config.name] = metric_config
     
-    def compute_all_metrics(self, choice: Any) -> Dict[str, List[float]]:
+    def compute_all_metrics(self, choice: Any, k: Optional[int] = None) -> Dict[str, List[float]]:
         """Compute all registered metrics for a choice"""
-        if not choice.logprobs or not choice.logprobs.content:
+        if not choice['logprobs'] or not choice['logprobs']['content']:
             return {name: [] for name in self.metrics.keys()}
         
         results = {}
-        token_data_list = choice.logprobs.content
+        token_data_list = choice['logprobs']['content']
         
         for metric_name, metric_config in self.metrics.items():
-            results[metric_name] = metric_config.compute_fn(token_data_list)
-        
+            if metric_config.uses_k:
+                results[metric_name] = metric_config.compute_fn(token_data_list, k)
+            else:
+                results[metric_name] = metric_config.compute_fn(token_data_list)
+
         return results
     
     # Individual metric computation functions
-    def _compute_mean_confidence(self, token_data_list: List[Any]) -> List[float]:
+    def _compute_mean_confidence(self, token_data_list: List[Any], k: Optional[int] = None) -> List[float]:
         """Mean confidence = negative average of top logprobs"""
         confidences = []
         for token_data in token_data_list:
-            if token_data.top_logprobs:
-                logprobs = [lp.logprob for lp in token_data.top_logprobs]
+            if token_data['top_logprobs']:
+                logprobs = [lp['logprob'] for lp in token_data['top_logprobs']]
+                if k is not None:
+                    logprobs = logprobs[:k]
                 confidences.append(-np.mean(logprobs))
             else:
-                confidences.append(-token_data.logprob)
+                confidences.append(-token_data['logprob'])
         return confidences
     
-    def _compute_median_confidence(self, token_data_list: List[Any]) -> List[float]:
+    def _compute_median_confidence(self, token_data_list: List[Any], k: Optional[int] = None) -> List[float]:
         """Median confidence = negative median of top logprobs"""
         confidences = []
         for token_data in token_data_list:
-            if token_data.top_logprobs:
-                logprobs = [lp.logprob for lp in token_data.top_logprobs]
+            if token_data['top_logprobs']:
+                logprobs = [lp['logprob'] for lp in token_data['top_logprobs']]
+                if k is not None:
+                    logprobs = logprobs[:k]
                 confidences.append(-np.median(logprobs))
             else:
-                confidences.append(-token_data.logprob)
+                confidences.append(-token_data['logprob'])
         return confidences
     
-    def _compute_variance_confidence(self, token_data_list: List[Any]) -> List[float]:
+    def _compute_variance_confidence(self, token_data_list: List[Any], k: Optional[int] = None) -> List[float]:
         """Variance of top-k logprobs"""
         confidences = []
         for token_data in token_data_list:
-            if token_data.top_logprobs:
-                logprobs = [lp.logprob for lp in token_data.top_logprobs]
+            if token_data['top_logprobs']:
+                logprobs = [lp['logprob'] for lp in token_data['top_logprobs']]
+                if k is not None:
+                    logprobs = logprobs[:k]
                 confidences.append(np.var(logprobs))
             else:
                 confidences.append(0.0)
@@ -152,8 +176,8 @@ class ConfidenceMetrics:
         """Gap between top-1 and top-2 logprobs"""
         confidences = []
         for token_data in token_data_list:
-            if token_data.top_logprobs and len(token_data.top_logprobs) >= 2:
-                logprobs = [lp.logprob for lp in token_data.top_logprobs]
+            if token_data['top_logprobs'] and len(token_data['top_logprobs']) >= 2:
+                logprobs = [lp['logprob'] for lp in token_data['top_logprobs']]
                 confidences.append(logprobs[0] - logprobs[1])
             else:
                 confidences.append(0.0)
@@ -163,26 +187,30 @@ class ConfidenceMetrics:
         """Top-1 probability (The probability of the most likely token)"""
         confidences = []
         for token_data in token_data_list:
-            confidences.append(np.exp(token_data.logprob))
+            confidences.append(np.exp(token_data['logprob']))
         return confidences
     
-    def _compute_exp_mean_confidence(self, token_data_list: List[Any]) -> List[float]:
+    def _compute_exp_mean_confidence(self, token_data_list: List[Any], k: Optional[int] = None) -> List[float]:
         """Exponential of mean (geometric mean in probability space)"""
         confidences = []
         for token_data in token_data_list:
-            if token_data.top_logprobs:
-                logprobs = [lp.logprob for lp in token_data.top_logprobs]
+            if token_data['top_logprobs']:
+                logprobs = [lp['logprob'] for lp in token_data['top_logprobs']]
+                if k is not None:
+                    logprobs = logprobs[:k]
                 confidences.append(np.exp(-np.mean(logprobs)))
             else:
-                confidences.append(np.exp(-token_data.logprob))
+                confidences.append(np.exp(-token_data['logprob']))
         return confidences
     
-    def _compute_distinctiveness_confidence(self, token_data_list: List[Any]) -> List[float]:
+    def _compute_distinctiveness_confidence(self, token_data_list: List[Any], k: Optional[int] = None) -> List[float]:
         """Z-score normalized difference between top-1 and mean of others"""
         confidences = []
         for token_data in token_data_list:
-            if token_data.top_logprobs and len(token_data.top_logprobs) > 1:
-                logprobs = [lp.logprob for lp in token_data.top_logprobs]
+            if token_data['top_logprobs'] and len(token_data['top_logprobs']) > 1:
+                logprobs = [lp['logprob'] for lp in token_data['top_logprobs']]
+                if k is not None:
+                    logprobs = logprobs[:k]
                 top1 = logprobs[0]
                 others = logprobs[1:]
                 mean_others = np.mean(others)
@@ -193,18 +221,18 @@ class ConfidenceMetrics:
                 confidences.append(0.0)
         return confidences
     
-    def _compute_entropy_uncertainty(self, token_data_list: List[Any]) -> List[float]:
+    def _compute_entropy_uncertainty(self, token_data_list: List[Any], k: Optional[int] = None) -> List[float]:
         """
         Normalized Entropy of the top-k probability distribution 
         (Higher value = Higher Uncertainty).
         """
         uncertainties = []
         for token_data in token_data_list:
-            if not token_data.top_logprobs:
+            if not token_data['top_logprobs']:
                 uncertainties.append(0.0)
                 continue
                 
-            probs = _get_topk_probs(token_data)
+            probs = _get_topk_probs(token_data, k)
             
             # Shannon Entropy H = - sum(p * log(p))
             # Exclude p=0 to avoid log(0) error
@@ -215,7 +243,7 @@ class ConfidenceMetrics:
             
         return uncertainties
     
-    def _compute_perplexity_uncertainty(self, token_data_list: List[Any]) -> List[float]:
+    def _compute_perplexity_uncertainty(self, token_data_list: List[Any], k: Optional[int] = None) -> List[float]:
         """
         Perplexity (2^Entropy) of the top-k distribution 
         (Higher value = Higher Uncertainty).
@@ -223,7 +251,7 @@ class ConfidenceMetrics:
         """
         uncertainties = []
         # Reuse the entropy calculation
-        entropy_values = self._compute_entropy_uncertainty(token_data_list)
+        entropy_values = self._compute_entropy_uncertainty(token_data_list, k)
         
         for entropy in entropy_values:
             # Perplexity is 2^H
@@ -231,7 +259,7 @@ class ConfidenceMetrics:
             
         return uncertainties
     
-    def _compute_kl_divergence_confidence(self, token_data_list: List[Any]) -> List[float]:
+    def _compute_kl_divergence_confidence(self, token_data_list: List[Any], k: Optional[int] = None) -> List[float]:
         """
         Computes the Kullback-Leibler (KL) Divergence from the token's top-K 
         normalized distribution (P) to a uniform distribution (Q).
@@ -248,7 +276,7 @@ class ConfidenceMetrics:
         confidences = []
 
         for token_data in token_data_list:
-            if not token_data.top_logprobs:
+            if not token_data['top_logprobs']:
                 # If only the main logprob is available, the distribution is singular (P=1)
                 # H(P) = 0, D_KL = 0 (since K=1, log(K)=0)
                 confidences.append(0.0)
@@ -257,7 +285,9 @@ class ConfidenceMetrics:
             # 1. Prepare P (Normalized Probabilities)
             
             # Get the logprobs and K (number of top choices)
-            logprobs = np.array([lp.logprob for lp in token_data.top_logprobs])
+            logprobs = np.array([lp['logprob'] for lp in token_data['top_logprobs']])
+            if k is not None:
+                logprobs = logprobs[:k]
             K = len(logprobs)
             
             # Convert log-probabilities to a normalized probability distribution P (local softmax)
@@ -290,7 +320,7 @@ class ConfidenceMetrics:
 
     def compute_inverse_probability_uncertainty(self, token_data_list: List[Any]) -> List[float]:
         """
-        Computes the Inverse Probability of the sampled token (1/P_l) for EACH token 
+        Computes the Inverse Probability of the sampled token (1/P_l) for each token 
         in the sequence.
         
         Metric calculated per token: V_l = exp(-log(P(y_l | y_<l)))
@@ -310,7 +340,7 @@ class ConfidenceMetrics:
         # Extract the log probability of the sampled token for each step
         try:
             # log_probs[l] = log(P(y_l | y_<l))
-            log_probs = np.array([token_data.logprob for token_data in token_data_list])
+            log_probs = np.array([token_data['logprob'] for token_data in token_data_list])
         except AttributeError:
             print("Error: Input list does not contain objects with a 'logprob' attribute.")
             return [0.0] * len(token_data_list)
@@ -323,7 +353,7 @@ class ConfidenceMetrics:
         return inverse_probs_per_token.tolist()
         
 
-    def _compute_renyi_divergence_uncertainty(self, token_data_list: List[Any], alpha: float = 2.0) -> List[float]:
+    def _compute_renyi_divergence_uncertainty(self, token_data_list: List[Any], k: Optional[int] = None, alpha: float = 2.0) -> List[float]:
         """
         Computes the per-token Rényi Divergence (alpha=2.0 by default) 
         from the normalized P distribution to a uniform Q distribution over K.
@@ -334,7 +364,7 @@ class ConfidenceMetrics:
 
         uncertainties = []
         for token_data in token_data_list:
-            P, K = _get_topk_probs_np(token_data)
+            P, K = _get_topk_probs_np(token_data, k)
             
             # If K=1, the distribution is singular, divergence is 0.
             if K <= 1:
@@ -354,7 +384,7 @@ class ConfidenceMetrics:
 
 # ----------------------------------------------------------------------------
 
-    def _compute_fisher_rao_distance_uncertainty(self, token_data_list: List[Any]) -> List[float]:
+    def _compute_fisher_rao_distance_uncertainty(self, token_data_list: List[Any], k: Optional[int] = None) -> List[float]:
         """
         Computes the per-token Fisher-Rao based distance (as defined in the query)
         from the normalized P distribution to a uniform Q distribution over K.
@@ -362,7 +392,7 @@ class ConfidenceMetrics:
         """
         uncertainties = []
         for token_data in token_data_list:
-            P, K = _get_topk_probs_np(token_data)
+            P, K = _get_topk_probs_np(token_data, k)
             
             # If K=1, the distance is 0.
             if K <= 1:
@@ -387,8 +417,8 @@ class ConfidenceMetrics:
         """Gap between top-1 and top-2 logprobs (Higher value = Higher Confidence)."""
         confidences = []
         for token_data in token_data_list:
-            if token_data.top_logprobs and len(token_data.top_logprobs) >= 2:
-                logprobs = [lp.logprob for lp in token_data.top_logprobs]
+            if token_data['top_logprobs'] and len(token_data['top_logprobs']) >= 2:
+                logprobs = [lp['logprob'] for lp in token_data['top_logprobs']]
                 # Gap is log(P1) - log(P2)
                 probs = np.exp(logprobs)
                 confidences.append(probs[0] - probs[1])

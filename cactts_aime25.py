@@ -40,6 +40,7 @@ from pathlib import Path
 import openai
 import argparse
 import os
+from concurrent.futures import ProcessPoolExecutor
 
 # Import modular components
 from metrics import ConfidenceMetrics, aggregate_metrics
@@ -71,17 +72,17 @@ class ResponseResult:
     aggregated_metrics: Dict[str, float]  # All metrics flattened
 
 class AIMEEvaluator:
-    def __init__(self, client, model_id: str, output_dir: str):
+    def __init__(self, client, model_id: str, output_dir: str, choices_dir: str = 'choices', metrics_file: str = 'all_response_metrics.jsonl', strategies_file: str = 'strategy_results.json'):
         self.client = client
         self.model_id = model_id
         self.output_dir = output_dir
         self.metrics_calculator = ConfidenceMetrics()
         
         # Storage paths
-        self.choices_dir = os.path.join(output_dir, 'choices')
-        self.metrics_file = os.path.join(output_dir, 'all_response_metrics.jsonl')
-        self.strategies_file = os.path.join(output_dir, 'strategy_results.json')
-        
+        self.choices_dir = os.path.join(output_dir, choices_dir)
+        self.metrics_file = os.path.join(output_dir, metrics_file)
+        self.strategies_file = os.path.join(output_dir, strategies_file)
+
     def load_aime_dataset(self, dataset_source: str, dataset_config: Optional[str] = None, split: str = "test") -> List[AIMEProblem]:
         """
         Load AIME 2025 dataset from Hugging Face or local JSON file.
@@ -226,15 +227,15 @@ class AIMEEvaluator:
 
         # Return all generated choices
         return response.choices
-    
-    def evaluate_responses(self, problem: AIMEProblem, choices: List[Any], tail_n: int = 512, group_size: int = 1024) -> List[ResponseResult]:
+
+    def evaluate_responses(self, problem: AIMEProblem, choices: List[Any], tail_n: int = 512, group_size: int = 1024, k: Optional[int] = None) -> List[ResponseResult]:
         """Evaluate all responses for a problem"""
         results = []
         all_metrics_records = []
                 
         for i, choice in enumerate(choices):
             # Compute all metrics
-            metric_sequences = self.metrics_calculator.compute_all_metrics(choice)
+            metric_sequences = self.metrics_calculator.compute_all_metrics(choice, k)
             
             # Aggregate metrics (full, tail, group-based)
             aggregated = aggregate_metrics(
@@ -244,7 +245,7 @@ class AIMEEvaluator:
             )
             
             # Extract answer and check correctness
-            response_text = choice.message.content
+            response_text = choice['message']['content']
             extracted_answer = self.extract_answer_from_response(response_text)
             is_correct = extracted_answer == problem.answer
             
@@ -497,6 +498,169 @@ class AIMEEvaluator:
         
         return {
             'problem_results': all_results,
+            'strategy_results': strategy_results,
+            'dataset_info': dataset_info
+        }
+        
+    def _evaluate_problem_worker(self, problem, choices_filename, tail_n, group_size):
+        """
+        Worker function that runs in separate process.
+        Must be a top-level function or static method for pickling.
+        """
+        # Load choices
+        choices = ChoiceStorage.load_choices(choices_filename)
+        
+        # Evaluate responses
+        results = self.evaluate_responses(problem, choices, tail_n, group_size)
+        
+        # Apply selection strategies
+        strategies = self.apply_selection_strategies(results)
+        
+        return {
+            'problem': problem,
+            'results': results,
+            'strategies': strategies,
+            'n_correct': sum(1 for r in results if r.is_correct),
+            'total_generated': len(results)
+        }
+    
+    async def evaluate_dataset_offline(self, dataset_source: str, stored_choices_dir: str, topk_logprobs: Optional[int] = None, tail_n: int = 2048, 
+                                   group_size: int = 1024, split: str = 'train', 
+                                   max_concurrent_problems: int = 30) -> Dict[str, Any]:
+        """
+        Evaluate entire AIME dataset based on generated choices already stored on disk.
+        All problems are processed in parallel with controlled concurrency.
+        
+        Args:
+            dataset_source: HF dataset name or local file path
+            stored_choices_dir: Directory containing stored choices
+            tail_n: Tail confidence window size
+            group_size: Group size for evaluation
+            split: Dataset split to use
+            max_concurrent_problems: Maximum number of problems to process concurrently
+        """
+        
+        problems = self.load_aime_dataset(dataset_source, None, split)
+        
+        print(f"Loaded {len(problems)} problems for task evaluation")
+        print(f"Using tail-{tail_n} confidence for selection strategies")
+        print(f"Processing up to {max_concurrent_problems} problems concurrently")
+        print(f"📊 Task Success Metric: # of problems solved correctly out of {len(problems)} total")
+        
+        # Use ProcessPoolExecutor for CPU-bound work
+        num_workers = min(max_concurrent_problems, os.cpu_count() or 1)
+        print(f"Using {num_workers} worker processes")
+        
+        # Progress tracking
+        completed = {'count': 0}
+        completed_lock = asyncio.Lock()
+        
+        # Create process pool
+        loop = asyncio.get_event_loop()
+        executor = ProcessPoolExecutor(max_workers=num_workers)
+        
+        try:
+            async def evaluate_single_problem_offline(problem, idx):
+                """Evaluate a single problem with stored choices"""
+                try:
+                    print(f"\n[{idx + 1}/{len(problems)}] Starting evaluation for Problem {problem.problem_id}")
+                    
+                    choices_filename = os.path.join(stored_choices_dir, f"{problem.problem_id}_choices.pkl")
+                    
+                    # Run entire evaluation in process pool
+                    result = await loop.run_in_executor(
+                        executor,
+                        self._evaluate_problem_worker,
+                        problem, choices_filename, tail_n, group_size
+                    )
+                    
+                    async with completed_lock:
+                        completed['count'] += 1
+                        n_correct = result['n_correct']
+                        status = "✓ HAS CORRECT" if n_correct > 0 else "✗ NO CORRECT"
+                        print(f"[{completed['count']}/{len(problems)}] Completed Problem {problem.problem_id}: {n_correct}/{result['total_generated']} correct - {status}")
+                    
+                    return result
+                    
+                except Exception as e:
+                    print(f"Error evaluating problem {problem.problem_id}: {e}")
+                    async with completed_lock:
+                        completed['count'] += 1
+                    return {
+                        'problem': problem,
+                        'error': str(e),
+                        'n_correct': 0,
+                        'total_generated': 0
+                    }
+            
+            # Create tasks for all problems
+            tasks = [
+                evaluate_single_problem_offline(problem, idx)
+                for idx, problem in enumerate(problems)
+            ]
+            
+            print(f"\n{'='*60}")
+            print(f"Starting parallel evaluation of all {len(problems)} problems...")
+            print(f"{'='*60}\n")
+            
+            # Run all tasks concurrently
+            all_results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+        finally:
+            # Clean up executor
+            executor.shutdown(wait=True)
+        
+        # Filter out exceptions
+        valid_results = []
+        for i, result in enumerate(all_results):
+            if isinstance(result, Exception):
+                print(f"Exception in problem {i}: {result}")
+                valid_results.append({
+                    'problem': problems[i],
+                    'error': str(result),
+                    'n_correct': 0,
+                    'total_generated': 0
+                })
+            else:
+                valid_results.append(result)
+        
+        # Print final summary
+        total_correct = sum(1 for r in valid_results if r.get('n_correct', 0) > 0)
+        total_responses = sum(r.get('total_generated', 0) for r in valid_results)
+        print(f"\n{'='*80}")
+        print(f"EVALUATION COMPLETE")
+        print(f"{'='*80}")
+        print(f"Total problems: {len(problems)}")
+        print(f"Problems with ≥1 correct: {total_correct}/{len(problems)}")
+        print(f"Total responses evaluated: {total_responses}")
+        print(f"{'='*80}\n")
+        
+        # Aggregate results
+        dataset_info = {
+            'source': dataset_source,
+            'split': split,
+            'total_problems': len(problems),
+            'tail_n': tail_n,
+            'group_size': group_size,
+        }
+        
+        # Save strategy-level results
+        strategy_results = ResultsAggregator.aggregate_strategy_results(
+            valid_results,
+            dataset_info,
+            self.strategies_file
+        )
+        
+        print(f"\n{'='*80}")
+        print("RESULTS SAVED")
+        print(f"{'='*80}")
+        print(f"Strategy results: {self.strategies_file}")
+        print(f"All response metrics: {self.metrics_file}")
+        print(f"Full choices: {self.choices_dir}/")
+        print(f"{'='*80}\n")
+        
+        return {
+            'problem_results': valid_results,
             'strategy_results': strategy_results,
             'dataset_info': dataset_info
         }
