@@ -118,11 +118,11 @@ class ConfidenceMetrics:
     
     def compute_all_metrics(self, choice: Any, k: Optional[int] = None) -> Dict[str, List[float]]:
         """Compute all registered metrics for a choice"""
-        if not choice['logprobs'] or not choice['logprobs']['content']:
+        if not choice.logprobs or not choice.logprobs.content:
             return {name: [] for name in self.metrics.keys()}
         
         results = {}
-        token_data_list = choice['logprobs']['content']
+        token_data_list = choice.logprobs.content
         
         for metric_name, metric_config in self.metrics.items():
             if metric_config.uses_k:
@@ -137,34 +137,34 @@ class ConfidenceMetrics:
         """Mean confidence = negative average of top logprobs"""
         confidences = []
         for token_data in token_data_list:
-            if token_data['top_logprobs']:
-                logprobs = [lp['logprob'] for lp in token_data['top_logprobs']]
+            if token_data.top_logprobs:
+                logprobs = [lp.logprob for lp in token_data.top_logprobs]
                 if k is not None:
                     logprobs = logprobs[:k]
                 confidences.append(-np.mean(logprobs))
             else:
-                confidences.append(-token_data['logprob'])
+                confidences.append(-token_data.logprob)
         return confidences
     
     def _compute_median_confidence(self, token_data_list: List[Any], k: Optional[int] = None) -> List[float]:
         """Median confidence = negative median of top logprobs"""
         confidences = []
         for token_data in token_data_list:
-            if token_data['top_logprobs']:
-                logprobs = [lp['logprob'] for lp in token_data['top_logprobs']]
+            if token_data.top_logprobs:
+                logprobs = [lp.logprob for lp in token_data.top_logprobs]
                 if k is not None:
                     logprobs = logprobs[:k]
                 confidences.append(-np.median(logprobs))
             else:
-                confidences.append(-token_data['logprob'])
+                confidences.append(-token_data.logprob)
         return confidences
     
     def _compute_variance_confidence(self, token_data_list: List[Any], k: Optional[int] = None) -> List[float]:
         """Variance of top-k logprobs"""
         confidences = []
         for token_data in token_data_list:
-            if token_data['top_logprobs']:
-                logprobs = [lp['logprob'] for lp in token_data['top_logprobs']]
+            if token_data.top_logprobs:
+                logprobs = [lp.logprob for lp in token_data.top_logprobs]
                 if k is not None:
                     logprobs = logprobs[:k]
                 confidences.append(np.var(logprobs))
@@ -176,8 +176,8 @@ class ConfidenceMetrics:
         """Gap between top-1 and top-2 logprobs"""
         confidences = []
         for token_data in token_data_list:
-            if token_data['top_logprobs'] and len(token_data['top_logprobs']) >= 2:
-                logprobs = [lp['logprob'] for lp in token_data['top_logprobs']]
+            if token_data.top_logprobs and len(token_data.top_logprobs) >= 2:
+                logprobs = [lp.logprob for lp in token_data.top_logprobs]
                 confidences.append(logprobs[0] - logprobs[1])
             else:
                 confidences.append(0.0)
@@ -187,28 +187,28 @@ class ConfidenceMetrics:
         """Top-1 probability (The probability of the most likely token)"""
         confidences = []
         for token_data in token_data_list:
-            confidences.append(np.exp(token_data['logprob']))
+            confidences.append(np.exp(token_data.logprob))
         return confidences
     
     def _compute_exp_mean_confidence(self, token_data_list: List[Any], k: Optional[int] = None) -> List[float]:
         """Exponential of mean (geometric mean in probability space)"""
         confidences = []
         for token_data in token_data_list:
-            if token_data['top_logprobs']:
-                logprobs = [lp['logprob'] for lp in token_data['top_logprobs']]
+            if token_data.top_logprobs:
+                logprobs = [lp.logprob for lp in token_data.top_logprobs]
                 if k is not None:
                     logprobs = logprobs[:k]
                 confidences.append(np.exp(-np.mean(logprobs)))
             else:
-                confidences.append(np.exp(-token_data['logprob']))
+                confidences.append(np.exp(-token_data.logprob))
         return confidences
     
     def _compute_distinctiveness_confidence(self, token_data_list: List[Any], k: Optional[int] = None) -> List[float]:
         """Z-score normalized difference between top-1 and mean of others"""
         confidences = []
         for token_data in token_data_list:
-            if token_data['top_logprobs'] and len(token_data['top_logprobs']) > 1:
-                logprobs = [lp['logprob'] for lp in token_data['top_logprobs']]
+            if token_data.top_logprobs and len(token_data.top_logprobs) > 1:
+                logprobs = [lp.logprob for lp in token_data.top_logprobs]
                 if k is not None:
                     logprobs = logprobs[:k]
                 top1 = logprobs[0]
@@ -228,7 +228,7 @@ class ConfidenceMetrics:
         """
         uncertainties = []
         for token_data in token_data_list:
-            if not token_data['top_logprobs']:
+            if not token_data.top_logprobs:
                 uncertainties.append(0.0)
                 continue
                 
@@ -276,7 +276,7 @@ class ConfidenceMetrics:
         confidences = []
 
         for token_data in token_data_list:
-            if not token_data['top_logprobs']:
+            if not token_data.top_logprobs:
                 # If only the main logprob is available, the distribution is singular (P=1)
                 # H(P) = 0, D_KL = 0 (since K=1, log(K)=0)
                 confidences.append(0.0)
@@ -285,7 +285,7 @@ class ConfidenceMetrics:
             # 1. Prepare P (Normalized Probabilities)
             
             # Get the logprobs and K (number of top choices)
-            logprobs = np.array([lp['logprob'] for lp in token_data['top_logprobs']])
+            logprobs = np.array([lp.logprob for lp in token_data.top_logprobs])
             if k is not None:
                 logprobs = logprobs[:k]
             K = len(logprobs)
@@ -340,7 +340,7 @@ class ConfidenceMetrics:
         # Extract the log probability of the sampled token for each step
         try:
             # log_probs[l] = log(P(y_l | y_<l))
-            log_probs = np.array([token_data['logprob'] for token_data in token_data_list])
+            log_probs = np.array([token_data.logprob for token_data in token_data_list])
         except AttributeError:
             print("Error: Input list does not contain objects with a 'logprob' attribute.")
             return [0.0] * len(token_data_list)
@@ -417,8 +417,8 @@ class ConfidenceMetrics:
         """Gap between top-1 and top-2 logprobs (Higher value = Higher Confidence)."""
         confidences = []
         for token_data in token_data_list:
-            if token_data['top_logprobs'] and len(token_data['top_logprobs']) >= 2:
-                logprobs = [lp['logprob'] for lp in token_data['top_logprobs']]
+            if token_data.top_logprobs and len(token_data.top_logprobs) >= 2:
+                logprobs = [lp.logprob for lp in token_data.top_logprobs]
                 # Gap is log(P1) - log(P2)
                 probs = np.exp(logprobs)
                 confidences.append(probs[0] - probs[1])

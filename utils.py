@@ -1,16 +1,26 @@
 import numpy as np
 from typing import Any, Tuple, Optional
-from types import SimpleNamespace
+from openai.types.chat.chat_completion import Choice
+class CustomChoice(Choice):
+    def __init__(self, rollout_idx=None, problem_id=None, **kwargs):
+        super().__init__(**kwargs)
+        self.rollout_idx = rollout_idx
+        self.problem_id = problem_id
+    
+    @classmethod
+    def from_dict(cls, data: dict):
+        """Automatically reconstruct from dictionary"""
+        return cls(**data)
 
 # Helper function for creating distribution of logprobs
 def _get_topk_probs(token_data: Any, k: Optional[int] = None) -> np.ndarray:
     """Helper to convert top_logprobs (up to top_k) into probabilities."""
-    if not token_data['top_logprobs']:
+    if not token_data.top_logprobs:
         # Fallback if top_logprobs is not available (only main logprob is used)
-        return np.array([np.exp(token_data['logprob'])])
+        return np.array([np.exp(token_data.logprob)])
 
     # 1. Get the logprobs
-    logprobs = np.array([lp['logprob'] for lp in token_data['top_logprobs']])
+    logprobs = np.array([lp.logprob for lp in token_data.top_logprobs])
     if k is not None:
         logprobs = logprobs[:k]
     
@@ -29,12 +39,10 @@ def _get_topk_probs(token_data: Any, k: Optional[int] = None) -> np.ndarray:
 
 def _get_topk_probs_np(token_data: Any, k: Optional[int] = None) -> Tuple[np.ndarray, int]:
     """Helper to convert top_logprobs into normalized probabilities P and return K."""
-    if not token_data['top_logprobs']:
+    if not token_data.top_logprobs:
         return np.array([1.0]), 1
 
-    logprobs = np.array([lp['logprob'] for lp in token_data['top_logprobs']])
-    if k is not None:
-        logprobs = logprobs[:k]
+    logprobs = np.array([lp.logprob for lp in token_data.top_logprobs])
     K = len(logprobs)
     
     unnormalized_probs = np.exp(logprobs)

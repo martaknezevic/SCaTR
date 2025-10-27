@@ -9,6 +9,9 @@ import gzip
 from typing import List, Dict, Any
 from dataclasses import asdict
 from filelock import FileLock
+from vllm.entrypoints.openai.protocol import ChatCompletionResponseChoice
+from openai.types.chat.chat_completion import Choice
+from utils import CustomChoice
 
 
 class ChoiceStorage:
@@ -61,24 +64,21 @@ class ChoiceStorage:
         """Save choices to disk efficiently"""
         os.makedirs(output_dir, exist_ok=True)
         
-        # Serialize all choices
-        serialized_choices = []
+        ## Serialize all choices
         for i, choice in enumerate(choices):
-            choice_data = ChoiceStorage.serialize_choice(choice)
-            choice_data['rollout_idx'] = i
-            choice_data['problem_id'] = problem_id
-            serialized_choices.append(choice_data)
-        
+            choice.rollout_idx = i
+            choice.problem_id = problem_id
+
         # Save with or without compression
         filename = os.path.join(output_dir, f"{problem_id}_choices.pkl")
         
         if use_compression:
             filename += ".gz"
             with gzip.open(filename, 'wb') as f:
-                pickle.dump(serialized_choices, f, protocol=pickle.HIGHEST_PROTOCOL)
+                pickle.dump(choices, f, protocol=pickle.HIGHEST_PROTOCOL)
         else:
             with open(filename, 'wb') as f:
-                pickle.dump(serialized_choices, f, protocol=pickle.HIGHEST_PROTOCOL)
+                pickle.dump(choices, f, protocol=pickle.HIGHEST_PROTOCOL)
         
         return filename
     
@@ -87,10 +87,31 @@ class ChoiceStorage:
         """Load choices from disk"""
         if filename.endswith('.gz'):
             with gzip.open(filename, 'rb') as f:
-                return pickle.load(f)
+                loaded_data = pickle.load(f)
         else:
             with open(filename, 'rb') as f:
-                return pickle.load(f)
+                loaded_data = pickle.load(f)
+                
+        if not isinstance(loaded_data, list):
+            raise ValueError("Expected a list from pickle file")
+        
+        # Check what's in the list
+        if not loaded_data:  # Empty list
+            return []
+        
+        # Check first item to determine type
+        first_item = loaded_data[0]
+        
+        if isinstance(first_item, dict):
+            # Convert all dicts to CustomChoice
+            return [CustomChoice.from_dict(item) for item in loaded_data]
+
+        elif isinstance(first_item, (Choice, CustomChoice)):
+            # Already proper Choice objects, return as-is
+            return loaded_data
+        
+        else:
+            raise ValueError(f"Unexpected type in list: {type(first_item)}")
 
 
 class MetricsStorage:

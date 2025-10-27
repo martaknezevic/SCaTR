@@ -245,7 +245,7 @@ class AIMEEvaluator:
             )
             
             # Extract answer and check correctness
-            response_text = choice['message']['content']
+            response_text = choice.message.content
             extracted_answer = self.extract_answer_from_response(response_text)
             is_correct = extracted_answer == problem.answer
             
