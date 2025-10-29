@@ -502,7 +502,7 @@ class AIMEEvaluator:
             'dataset_info': dataset_info
         }
         
-    def _evaluate_problem_worker(self, problem, choices_filename, tail_n, group_size):
+    def _evaluate_problem_worker(self, problem, choices_filename, tail_n, group_size, topk_logprobs=None) -> Dict[str, Any]:
         """
         Worker function that runs in separate process.
         Must be a top-level function or static method for pickling.
@@ -511,7 +511,7 @@ class AIMEEvaluator:
         choices = ChoiceStorage.load_choices(choices_filename)
         
         # Evaluate responses
-        results = self.evaluate_responses(problem, choices, tail_n, group_size)
+        results = self.evaluate_responses(problem, choices, tail_n, group_size, topk_logprobs)
         
         # Apply selection strategies
         strategies = self.apply_selection_strategies(results)
@@ -571,7 +571,7 @@ class AIMEEvaluator:
                     result = await loop.run_in_executor(
                         executor,
                         self._evaluate_problem_worker,
-                        problem, choices_filename, tail_n, group_size
+                        problem, choices_filename, tail_n, group_size, topk_logprobs
                     )
                     
                     async with completed_lock:

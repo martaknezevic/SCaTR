@@ -57,7 +57,7 @@ async def main():
         topk_logprobs=args.topk_logprobs,
         split=args.split,
         tail_n=args.tail_n,
-        group_size=1024
+        group_size=args.group_size
     )
     
     end_time = time.time()
