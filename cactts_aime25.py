@@ -310,7 +310,10 @@ class AIMEEvaluator:
             
             # Extract answer and check correctness
             response_text = choice.message.content
-            extracted_answer = self.extract_answer_from_response(response_text)
+            if response_text is not None:
+                extracted_answer = self.extract_answer_from_response(response_text)
+            else:
+                extracted_answer = None
             is_correct = extracted_answer == problem.answer
             
             # Create result
