@@ -41,10 +41,13 @@ import openai
 import argparse
 import os
 from concurrent.futures import ProcessPoolExecutor
+from openai.types.chat import ChatCompletion, ChatCompletionMessage
+from openai.types.chat.chat_completion import Choice
 
 # Import modular components
 from metrics import ConfidenceMetrics, aggregate_metrics
 from storage import ChoiceStorage, MetricsStorage, ResultsAggregator
+from openai.types.chat.chat_completion import ChoiceLogprobs
 
 try:
     from datasets import load_dataset
@@ -72,11 +75,12 @@ class ResponseResult:
     aggregated_metrics: Dict[str, float]  # All metrics flattened
 
 class AIMEEvaluator:
-    def __init__(self, client, model_id: str, output_dir: str, choices_dir: str = 'choices', metrics_file: str = 'all_response_metrics.jsonl', strategies_file: str = 'strategy_results.json'):
+    def __init__(self, client, model_id: str, output_dir: str, streaming=False, choices_dir: str = 'choices', metrics_file: str = 'all_response_metrics.jsonl', strategies_file: str = 'strategy_results.json'):
         self.client = client
         self.model_id = model_id
         self.output_dir = output_dir
         self.metrics_calculator = ConfidenceMetrics()
+        self.streaming = streaming
         
         # Storage paths
         self.choices_dir = os.path.join(output_dir, choices_dir)
@@ -208,6 +212,75 @@ class AIMEEvaluator:
         # If no clear answer found, return -1 to indicate extraction failure
         return -1
     
+    async def generate_single_response_stream(self, config: Dict[str, Any]) -> Choice:
+        """Generate a single response with streaming and accumulate all data including logprobs"""
+        stream_config = {**config, "stream": True, "stream_options": {"include_usage": True}}
+        
+        # Ensure logprobs are requested
+        if "logprobs" not in stream_config or not stream_config.get("logprobs"):
+            stream_config["logprobs"] = True
+            stream_config["top_logprobs"] = config.get("top_logprobs", 10)
+        
+        stream = await self.client.chat.completions.create(**stream_config)
+        
+        # Accumulators
+        accumulated_content = ""
+        accumulated_logprobs_content = []
+        finish_reason = None
+        index = 0
+        
+        async for chunk in stream:
+            if not chunk.choices or len(chunk.choices) == 0:
+                continue
+                
+            choice = chunk.choices[0]
+            index = choice.index
+            
+            # Accumulate content
+            if hasattr(choice, 'delta') and choice.delta:
+                if hasattr(choice.delta, 'content') and choice.delta.content:
+                    accumulated_content += choice.delta.content
+            
+            # Accumulate logprobs token by token
+            if hasattr(choice, 'logprobs') and choice.logprobs:
+                if hasattr(choice.logprobs, 'content') and choice.logprobs.content:
+                    accumulated_logprobs_content.extend(choice.logprobs.content)
+            
+            # Capture finish reason
+            if hasattr(choice, 'finish_reason') and choice.finish_reason:
+                finish_reason = choice.finish_reason
+        
+        # Create ChatCompletionMessage
+        message = ChatCompletionMessage(
+            content=accumulated_content,
+            role="assistant",
+            function_call=None,
+            tool_calls=None
+        )
+        
+        # Create ChoiceLogprobs
+        
+        logprobs = ChoiceLogprobs(
+            content=accumulated_logprobs_content if accumulated_logprobs_content else None,
+            refusal=None
+        )
+        
+        # Create Choice using OpenAI's class
+        final_choice = Choice(
+            finish_reason=finish_reason or "stop",
+            index=index,
+            logprobs=logprobs,
+            message=message
+        )
+        
+        return final_choice
+
+    async def generate_multiple_responses_streaming(self, config: Dict[str, Any], n_gen: int, seed: int) -> List[Choice]:
+        """Generate multiple responses concurrently with streaming"""       
+        tasks = [self.generate_single_response_stream(config) for _ in range(n_gen)]
+        choices = await asyncio.gather(*tasks)
+        return choices
+
     async def generate_single_response(self, config: Dict[str, Any]) -> Any:
         """Generate a single response asynchronously"""
         response = await self.client.chat.completions.create(**config)
@@ -218,15 +291,6 @@ class AIMEEvaluator:
         tasks = [self.generate_single_response(config) for _ in range(n_gen)]
         choices = await asyncio.gather(*tasks)
         return choices
-
-    async def generate_multiple_responses_(self, config: Dict[str, Any], n_gen: int, seed: int) -> List[Any]:
-        """Generate multiple responses from one API call"""
-        cfg = {**config, "n": n_gen, 'seed': seed}
-
-        response = await self.client.chat.completions.create(**cfg)
-
-        # Return all generated choices
-        return response.choices
 
     def evaluate_responses(self, problem: AIMEProblem, choices: List[Any], tail_n: int = 512, group_size: int = 1024, k: Optional[int] = None) -> List[ResponseResult]:
         """Evaluate all responses for a problem"""
@@ -339,7 +403,10 @@ class AIMEEvaluator:
         # Generate responses
         print(f"Generating {n_gen} responses...")
         time_start = time.time()
-        choices = await self.generate_multiple_responses(config, n_gen, seed)
+        if self.streaming:
+            choices = await self.generate_multiple_responses_streaming(config, n_gen, seed)
+        else:
+            choices = await self.generate_multiple_responses(config, n_gen, seed)
         time_end = time.time()
         print(f"Generation {problem.problem_id} complete in.............. {time_end - time_start:.1f}s")
         
@@ -678,6 +745,7 @@ def parse_args():
     parser.add_argument("--tail_n", type=int, default=512)
     parser.add_argument("--group_size", type=int, default=1024)
     parser.add_argument("--temperature", type=float, default=0.6)
+    parser.add_argument("--streaming", action='store_false', help="Enable streaming generation")
     
     # Performance
     parser.add_argument("--max_concurrent", type=int, default=3)
@@ -721,7 +789,7 @@ async def main():
     print(f"Using model: {model_id}")
     
     # Initialize evaluator
-    evaluator = AIMEEvaluator(client, model_id, output_dir)
+    evaluator = AIMEEvaluator(client, model_id, output_dir, streaming=args.streaming)
     
     # Run evaluation
     print("\n" + "="*80)
