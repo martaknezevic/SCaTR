@@ -291,6 +291,13 @@ class AIMEEvaluator:
         tasks = [self.generate_single_response(config) for _ in range(n_gen)]
         choices = await asyncio.gather(*tasks)
         return choices
+    
+    def _extract_message(self, choice):
+        """Extract full text message from a vLLM/OpenAI-style choice object."""
+        if not hasattr(choice, "logprobs") or not hasattr(choice.logprobs, "content"):
+            return ""
+        return "".join(cct.token for cct in choice.logprobs.content if hasattr(cct, "token"))
+
 
     def evaluate_responses(self, problem: AIMEProblem, choices: List[Any], tail_n: int = 512, group_size: int = 1024, k: Optional[int] = None) -> List[ResponseResult]:
         """Evaluate all responses for a problem"""
@@ -309,7 +316,8 @@ class AIMEEvaluator:
             )
             
             # Extract answer and check correctness
-            response_text = choice.message.content
+            # response_text = choice.message.content
+            response_text = self._extract_message(choice)
             if response_text is not None:
                 extracted_answer = self.extract_answer_from_response(response_text)
             else:
@@ -380,14 +388,14 @@ class AIMEEvaluator:
             )        
         return strategies
 
-    async def evaluate_problem(self, problem: AIMEProblem, n_gen: int, tail_n: int, group_size: int, temperature: float, seed: int) -> Dict[str, Any]:
+    async def evaluate_problem(self, problem: AIMEProblem, n_gen: int, tail_n: int, group_size: int, temperature: float, top_logprobs: int, seed: int) -> Dict[str, Any]:
         """Evaluate a single AIME problem"""
         print(f"\nEvaluating Problem {problem.problem_id}")
         print(f"Expected answer: {problem.answer}")
         
         config = {
             "model": self.model_id,
-            # "max_tokens": 8192,
+            # "max_tokens": 32768,
             "temperature": temperature,
             "messages": [
                 {
@@ -400,7 +408,8 @@ class AIMEEvaluator:
                 }
             ],
             "logprobs": True,
-            "top_logprobs": 10,
+            "top_logprobs": top_logprobs,
+            "extra_body": {"reasoning_effort": "high"}
         }
         
         # Generate responses
@@ -442,19 +451,19 @@ class AIMEEvaluator:
             'total_generated': len(results)
         }
 
-    async def evaluate_problem_with_semaphore(self, problem: AIMEProblem, n_gen: int, tail_n: int, group_size: int, temperature: float, semaphore: asyncio.Semaphore, seed: int) -> Dict[str, Any]:
+    async def evaluate_problem_with_semaphore(self, problem: AIMEProblem, n_gen: int, tail_n: int, group_size: int, temperature: float, top_logprobs: int, semaphore: asyncio.Semaphore, seed: int) -> Dict[str, Any]:
         """Evaluate a single problem with semaphore control"""
         async with semaphore:
-            return await self.evaluate_problem(problem, n_gen, tail_n, group_size, temperature, seed)
-    
+            return await self.evaluate_problem(problem, n_gen, tail_n, group_size, temperature=temperature, top_logprobs=top_logprobs, seed=seed)
+
     async def evaluate_problems_batch(self, problems: List[AIMEProblem], n_gen: int, tail_n: int, group_size: int,
-                                    max_concurrent: int = 3, temperature: float = 0.6, seed: int = 42) -> List[Dict[str, Any]]:
+                                    max_concurrent: int = 3, temperature: float = 0.6, top_logprobs: int = 10, seed: int = 42) -> List[Dict[str, Any]]:
         """Evaluate a batch of problems concurrently"""
         semaphore = asyncio.Semaphore(max_concurrent)
         
         # Create tasks for all problems in the batch
         tasks = [
-            self.evaluate_problem_with_semaphore(problem, n_gen, tail_n, group_size, temperature, semaphore, seed) 
+            self.evaluate_problem_with_semaphore(problem, n_gen, tail_n, group_size, temperature=temperature, top_logprobs=top_logprobs, semaphore=semaphore, seed=seed) 
             for problem in problems
         ]
         
@@ -486,7 +495,7 @@ class AIMEEvaluator:
     
     async def evaluate_dataset(self, dataset_source: str, n_gen: int, tail_n: int = 2048, group_size: int = 1024,
                               dataset_config: Optional[str] = None, split: str = "test",
-                              max_concurrent_problems: int = 3, batch_size: int = 10, temperature: float = 0.6, seed: int = 42) -> Dict[str, Any]:
+                              max_concurrent_problems: int = 3, batch_size: int = 10, temperature: float = 0.6, top_logprobs: int = 10, seed: int = 42) -> Dict[str, Any]:
         """
         Evaluate entire AIME dataset with concurrent problem processing
         
@@ -526,7 +535,7 @@ class AIMEEvaluator:
             # Process current batch concurrently
             try:
                 batch_results = await self.evaluate_problems_batch(
-                    current_batch, n_gen, tail_n, group_size, max_concurrent_problems, temperature, seed=seed
+                    current_batch, n_gen, tail_n, group_size, max_concurrent_problems, temperature=temperature, top_logprobs=top_logprobs, seed=seed
                 )
                 
                 all_results.extend(batch_results)
@@ -748,7 +757,8 @@ def parse_args():
     parser.add_argument("--tail_n", type=int, default=512)
     parser.add_argument("--group_size", type=int, default=1024)
     parser.add_argument("--temperature", type=float, default=0.6)
-    parser.add_argument("--streaming", action='store_false', help="Enable streaming generation")
+    parser.add_argument("--top_logprobs", type=int, default=10)
+    parser.add_argument("--streaming", action='store_true', help="Enable streaming generation")
     
     # Performance
     parser.add_argument("--max_concurrent", type=int, default=3)
@@ -783,7 +793,7 @@ async def main():
     client = openai.AsyncOpenAI(
         base_url=f"http://localhost:{args.port}/v1",
         api_key="token-abc",
-        timeout=30 * 60,
+        timeout=30 * 60 * 2,
     )
     
     # Get model
