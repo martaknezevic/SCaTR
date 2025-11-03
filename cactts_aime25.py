@@ -27,7 +27,7 @@ Popular AIME/Math Datasets on HF:
 - lighteval/MATH
 - AI-MO/NuminaMath-CoT
 """
-
+import time
 import openai
 import numpy as np
 import asyncio
@@ -35,8 +35,19 @@ import json
 import random
 import re
 from typing import List, Dict, Any, Tuple, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from pathlib import Path
+import openai
+import argparse
+import os
+from concurrent.futures import ProcessPoolExecutor
+from openai.types.chat import ChatCompletion, ChatCompletionMessage
+from openai.types.chat.chat_completion import Choice
+
+# Import modular components
+from metrics import ConfidenceMetrics, aggregate_metrics
+from storage import ChoiceStorage, MetricsStorage, ResultsAggregator
+from openai.types.chat.chat_completion import ChoiceLogprobs
 
 try:
     from datasets import load_dataset
@@ -59,18 +70,23 @@ class ResponseResult:
     response_text: str
     extracted_answer: int
     is_correct: bool
-    tail_confidence: float
-    mean_confidence: float
-    exp_tail_confidence: float  # New exponential confidence measure
-    exp_mean_confidence: float  # New exponential confidence measure
     total_tokens: int
     choice_index: int
+    aggregated_metrics: Dict[str, float]  # All metrics flattened
 
 class AIMEEvaluator:
-    def __init__(self, client, model_id: str):
+    def __init__(self, client, model_id: str, output_dir: str, streaming=False, choices_dir: str = 'choices', metrics_file: str = 'all_response_metrics.jsonl', strategies_file: str = 'strategy_results.json'):
         self.client = client
         self.model_id = model_id
+        self.output_dir = output_dir
+        self.metrics_calculator = ConfidenceMetrics()
+        self.streaming = streaming
         
+        # Storage paths
+        self.choices_dir = os.path.join(output_dir, choices_dir)
+        self.metrics_file = os.path.join(output_dir, metrics_file)
+        self.strategies_file = os.path.join(output_dir, strategies_file)
+
     def load_aime_dataset(self, dataset_source: str, dataset_config: Optional[str] = None, split: str = "test") -> List[AIMEProblem]:
         """
         Load AIME 2025 dataset from Hugging Face or local JSON file.
@@ -80,6 +96,7 @@ class AIMEEvaluator:
             dataset_config: Configuration name for HF dataset (optional)
             split: Dataset split to use (default: "test")
         """
+        # return self.create_sample_dataset()
         # Try loading from Hugging Face first
         if HF_AVAILABLE and not dataset_source.endswith('.json'):
             try:
@@ -195,94 +212,148 @@ class AIMEEvaluator:
         # If no clear answer found, return -1 to indicate extraction failure
         return -1
     
+    async def generate_single_response_stream(self, config: Dict[str, Any]) -> Choice:
+        """Generate a single response with streaming and accumulate all data including logprobs"""
+        stream_config = {**config, "stream": True, "stream_options": {"include_usage": True}}
+        
+        # Ensure logprobs are requested
+        if "logprobs" not in stream_config or not stream_config.get("logprobs"):
+            stream_config["logprobs"] = True
+            stream_config["top_logprobs"] = config.get("top_logprobs", 10)
+        
+        stream = await self.client.chat.completions.create(**stream_config)
+        
+        # Accumulators
+        accumulated_content = ""
+        accumulated_logprobs_content = []
+        finish_reason = None
+        index = 0
+        
+        async for chunk in stream:
+            if not chunk.choices or len(chunk.choices) == 0:
+                continue
+                
+            choice = chunk.choices[0]
+            index = choice.index
+            
+            # Accumulate content
+            if hasattr(choice, 'delta') and choice.delta:
+                if hasattr(choice.delta, 'content') and choice.delta.content:
+                    accumulated_content += choice.delta.content
+            
+            # Accumulate logprobs token by token
+            if hasattr(choice, 'logprobs') and choice.logprobs:
+                if hasattr(choice.logprobs, 'content') and choice.logprobs.content:
+                    accumulated_logprobs_content.extend(choice.logprobs.content)
+            
+            # Capture finish reason
+            if hasattr(choice, 'finish_reason') and choice.finish_reason:
+                finish_reason = choice.finish_reason
+        
+        # Create ChatCompletionMessage
+        message = ChatCompletionMessage(
+            content=accumulated_content,
+            role="assistant",
+            function_call=None,
+            tool_calls=None
+        )
+        
+        # Create ChoiceLogprobs
+        
+        logprobs = ChoiceLogprobs(
+            content=accumulated_logprobs_content if accumulated_logprobs_content else None,
+            refusal=None
+        )
+        
+        # Create Choice using OpenAI's class
+        final_choice = Choice(
+            finish_reason=finish_reason or "stop",
+            index=index,
+            logprobs=logprobs,
+            message=message
+        )
+        
+        return final_choice
+
+    async def generate_multiple_responses_streaming(self, config: Dict[str, Any], n_gen: int, seed: int) -> List[Choice]:
+        """Generate multiple responses concurrently with streaming"""       
+        tasks = [self.generate_single_response_stream(config) for _ in range(n_gen)]
+        choices = await asyncio.gather(*tasks)
+        return choices
+
     async def generate_single_response(self, config: Dict[str, Any]) -> Any:
         """Generate a single response asynchronously"""
         response = await self.client.chat.completions.create(**config)
         return response.choices[0]
     
-    async def generate_multiple_responses(self, config: Dict[str, Any], n_gen: int) -> List[Any]:
+    async def generate_multiple_responses(self, config: Dict[str, Any], n_gen: int, seed: int) -> List[Any]:
         """Generate multiple responses concurrently"""
         tasks = [self.generate_single_response(config) for _ in range(n_gen)]
         choices = await asyncio.gather(*tasks)
         return choices
     
-    def calculate_tail_confidence(self, choice: Any, tail_n: int = 512) -> Dict[str, Any]:
-        """Calculate tail confidence for a single trace with both standard and exponential measures"""
-        if not choice.logprobs or not choice.logprobs.content:
-            return {
-                'response': choice.message.content,
-                'tail_confidence': 0.0,
-                'mean_confidence': 0.0,
-                'exp_tail_confidence': 0.0,
-                'exp_mean_confidence': 0.0,
-                'tokens': [],
-                'confidences': [],
-                'exp_confidences': [],
-                'total_tokens': 0
-            }
-        
-        tokens = []
-        confidences = []
-        exp_confidences = []  # New exponential confidences
-        
-        # Convert logprobs to confidence
-        for token_data in choice.logprobs.content:
-            tokens.append(token_data.token)
-            
-            # Standard confidence calculation (existing method)
-            if token_data.top_logprobs:
-                # Mean confidence = negative average of top logprobs
-                mean_conf = -sum(logprob_data.logprob for logprob_data in token_data.top_logprobs) / len(token_data.top_logprobs)
-                confidences.append(mean_conf)
-            else:
-                # Fallback if no top_logprobs available
-                confidences.append(-token_data.logprob)
-            
-            # Exponential confidence calculation (new method)
-            exp_conf = np.exp(token_data.logprob)
-            exp_confidences.append(exp_conf)
-        
-        # Calculate tail confidence (average of bottom N tokens) for both measures
-        if len(confidences) >= tail_n:
-            tail_confidence = np.mean(confidences[-tail_n:])
-            exp_tail_confidence = np.mean(exp_confidences[-tail_n:])
-        else:
-            tail_confidence = np.mean(confidences) if confidences else 0.0
-            exp_tail_confidence = np.mean(exp_confidences) if exp_confidences else 0.0
-        
-        return {
-            'response': choice.message.content,
-            'tail_confidence': tail_confidence,
-            'mean_confidence': np.mean(confidences) if confidences else 0.0,
-            'exp_tail_confidence': exp_tail_confidence,
-            'exp_mean_confidence': np.mean(exp_confidences) if exp_confidences else 0.0,
-            'tokens': tokens,
-            'confidences': confidences,
-            'exp_confidences': exp_confidences,
-            'total_tokens': len(tokens)
-        }
-    
-    def evaluate_responses(self, problem: AIMEProblem, choices: List[Any], tail_n: int = 512) -> List[ResponseResult]:
+    def _extract_message(self, choice):
+        """Extract full text message from a vLLM/OpenAI-style choice object."""
+        if not hasattr(choice, "logprobs") or not hasattr(choice.logprobs, "content"):
+            return ""
+        return "".join(cct.token for cct in choice.logprobs.content if hasattr(cct, "token"))
+
+
+    def evaluate_responses(self, problem: AIMEProblem, choices: List[Any], tail_n: int = 512, group_size: int = 1024, k: Optional[int] = None) -> List[ResponseResult]:
         """Evaluate all responses for a problem"""
         results = []
-        
+        all_metrics_records = []
+                
         for i, choice in enumerate(choices):
-            confidence_data = self.calculate_tail_confidence(choice, tail_n)
-            extracted_answer = self.extract_answer_from_response(confidence_data['response'])
+            # Compute all metrics
+            metric_sequences = self.metrics_calculator.compute_all_metrics(choice, k)
+            
+            # Aggregate metrics (full, tail, group-based)
+            aggregated = aggregate_metrics(
+                metric_sequences,
+                tail_n=tail_n,
+                group_size=group_size
+            )
+            
+            # Extract answer and check correctness
+            # response_text = choice.message.content
+            response_text = self._extract_message(choice)
+            if response_text is not None:
+                extracted_answer = self.extract_answer_from_response(response_text)
+            else:
+                extracted_answer = None
             is_correct = extracted_answer == problem.answer
             
+            # Create result
             result = ResponseResult(
-                response_text=confidence_data['response'],
+                response_text=response_text,
                 extracted_answer=extracted_answer,
                 is_correct=is_correct,
-                tail_confidence=confidence_data['tail_confidence'],
-                mean_confidence=confidence_data['mean_confidence'],
-                exp_tail_confidence=confidence_data['exp_tail_confidence'],
-                exp_mean_confidence=confidence_data['exp_mean_confidence'],
-                total_tokens=confidence_data['total_tokens'],
-                choice_index=i
+                total_tokens=len(metric_sequences.get('mean', [])),
+                choice_index=i,
+                aggregated_metrics=aggregated
             )
             results.append(result)
+            
+            # Prepare metrics record for storage
+            metrics_record = {
+                'problem_id': problem.problem_id,
+                'rollout_idx': i,
+                'response_text': response_text,
+                'extracted_answer': extracted_answer,
+                'is_correct': is_correct,
+                'expected_answer': problem.answer,
+                'total_tokens': result.total_tokens,
+                **aggregated
+            }
+            all_metrics_records.append(metrics_record)
+        
+        # Save metrics to JSONL
+        MetricsStorage.save_all_metrics_batch(
+            all_metrics_records,
+            self.metrics_file,
+            use_compression=False
+        )
         
         return results
     
@@ -293,32 +364,39 @@ class AIMEEvaluator:
         # Random selection
         strategies['random'] = random.choice(results)
         
-        # Standard confidence strategies (existing)
-        strategies['highest_confidence'] = max(results, key=lambda x: x.tail_confidence)
-        strategies['lowest_confidence'] = min(results, key=lambda x: x.tail_confidence)
-        
-        # Exponential confidence strategies (new)
-        strategies['highest_exp_confidence'] = max(results, key=lambda x: x.exp_tail_confidence)
-        strategies['lowest_exp_confidence'] = min(results, key=lambda x: x.exp_tail_confidence)
-        
         # Oracle selection (best correct answer, or best if none correct)
         correct_results = [r for r in results if r.is_correct]
         if correct_results:
-            strategies['oracle'] = max(correct_results, key=lambda x: x.tail_confidence)
+            strategies['oracle'] = max(correct_results, key=lambda x: x.aggregated_metrics['mean_tail'])
         else:
-            strategies['oracle'] = max(results, key=lambda x: x.tail_confidence)
+            strategies['oracle'] = max(results, key=lambda x: x.aggregated_metrics['mean_tail'])
+
+        # Generate strategies for all metric aggregations
+        metric_keys = list(results[0].aggregated_metrics.keys()) if results else []
         
+        for metric_key in metric_keys:
+            # Highest strategy
+            strategies[f'highest_{metric_key}'] = max(
+                results, 
+                key=lambda x: x.aggregated_metrics.get(metric_key, 0)
+            )
+            
+            # Lowest strategy
+            strategies[f'lowest_{metric_key}'] = min(
+                results,
+                key=lambda x: x.aggregated_metrics.get(metric_key, 0)
+            )        
         return strategies
-    
-    async def evaluate_problem(self, problem: AIMEProblem, n_gen: int, tail_n: int) -> Dict[str, Any]:
+
+    async def evaluate_problem(self, problem: AIMEProblem, n_gen: int, tail_n: int, group_size: int, temperature: float, top_logprobs: int, seed: int) -> Dict[str, Any]:
         """Evaluate a single AIME problem"""
         print(f"\nEvaluating Problem {problem.problem_id}")
         print(f"Expected answer: {problem.answer}")
         
         config = {
             "model": self.model_id,
-            # "max_tokens": 8192,
-            "temperature": 0.6,
+            # "max_tokens": 32768,
+            "temperature": temperature,
             "messages": [
                 {
                     "role": "system", 
@@ -330,18 +408,40 @@ class AIMEEvaluator:
                 }
             ],
             "logprobs": True,
-            "top_logprobs": 10,
+            "top_logprobs": top_logprobs,
+            "extra_body": {"reasoning_effort": "high"}
         }
         
         # Generate responses
         print(f"Generating {n_gen} responses...")
-        choices = await self.generate_multiple_responses(config, n_gen)
+        time_start = time.time()
+        if self.streaming:
+            choices = await self.generate_multiple_responses_streaming(config, n_gen, seed)
+        else:
+            choices = await self.generate_multiple_responses(config, n_gen, seed)
+        time_end = time.time()
+        print(f"Generation {problem.problem_id} complete in.............. {time_end - time_start:.1f}s")
+        
+        time_start = time.time()
+        # Save full choices to disk
+        ChoiceStorage.save_choices(
+            problem.problem_id,
+            choices,
+            self.choices_dir,
+            use_compression=False
+        )
+        time_end = time.time()
+        print(f"Saved choices for {problem.problem_id} in.............. {time_end - time_start:.1f}s")
         
         # Evaluate responses
-        results = self.evaluate_responses(problem, choices, tail_n)
+        
+        time_start = time.time()
+        results = self.evaluate_responses(problem, choices, tail_n, group_size)
         
         # Apply selection strategies
         strategies = self.apply_selection_strategies(results)
+        time_end = time.time()
+        print(f"Evaluation {problem.problem_id} complete in.............. {time_end - time_start:.1f}s")
         
         return {
             'problem': problem,
@@ -351,19 +451,19 @@ class AIMEEvaluator:
             'total_generated': len(results)
         }
 
-    async def evaluate_problem_with_semaphore(self, problem: AIMEProblem, n_gen: int, tail_n: int, semaphore: asyncio.Semaphore) -> Dict[str, Any]:
+    async def evaluate_problem_with_semaphore(self, problem: AIMEProblem, n_gen: int, tail_n: int, group_size: int, temperature: float, top_logprobs: int, semaphore: asyncio.Semaphore, seed: int) -> Dict[str, Any]:
         """Evaluate a single problem with semaphore control"""
         async with semaphore:
-            return await self.evaluate_problem(problem, n_gen, tail_n)
-    
-    async def evaluate_problems_batch(self, problems: List[AIMEProblem], n_gen: int, tail_n: int, 
-                                    max_concurrent: int = 3) -> List[Dict[str, Any]]:
+            return await self.evaluate_problem(problem, n_gen, tail_n, group_size, temperature=temperature, top_logprobs=top_logprobs, seed=seed)
+
+    async def evaluate_problems_batch(self, problems: List[AIMEProblem], n_gen: int, tail_n: int, group_size: int,
+                                    max_concurrent: int = 3, temperature: float = 0.6, top_logprobs: int = 10, seed: int = 42) -> List[Dict[str, Any]]:
         """Evaluate a batch of problems concurrently"""
         semaphore = asyncio.Semaphore(max_concurrent)
         
         # Create tasks for all problems in the batch
         tasks = [
-            self.evaluate_problem_with_semaphore(problem, n_gen, tail_n, semaphore) 
+            self.evaluate_problem_with_semaphore(problem, n_gen, tail_n, group_size, temperature=temperature, top_logprobs=top_logprobs, semaphore=semaphore, seed=seed) 
             for problem in problems
         ]
         
@@ -380,12 +480,8 @@ class AIMEEvaluator:
                     'problem': problems[i],
                     'results': [],
                     'strategies': {
-                        'random': ResponseResult("Error", -1, False, 0.0, 0.0, 0.0, 0.0, 0, -1),
-                        'highest_confidence': ResponseResult("Error", -1, False, 0.0, 0.0, 0.0, 0.0, 0, -1),
-                        'lowest_confidence': ResponseResult("Error", -1, False, 0.0, 0.0, 0.0, 0.0, 0, -1),
-                        'highest_exp_confidence': ResponseResult("Error", -1, False, 0.0, 0.0, 0.0, 0.0, 0, -1),
-                        'lowest_exp_confidence': ResponseResult("Error", -1, False, 0.0, 0.0, 0.0, 0.0, 0, -1),
-                        'oracle': ResponseResult("Error", -1, False, 0.0, 0.0, 0.0, 0.0, 0, -1)
+                        'random': None,
+                        'oracle': None
                     },
                     'n_correct': 0,
                     'total_generated': 0,
@@ -397,9 +493,9 @@ class AIMEEvaluator:
         
         return successful_results
     
-    async def evaluate_dataset(self, dataset_source: str, n_gen: int, tail_n: int = 2048, 
+    async def evaluate_dataset(self, dataset_source: str, n_gen: int, tail_n: int = 2048, group_size: int = 1024,
                               dataset_config: Optional[str] = None, split: str = "test",
-                              max_concurrent_problems: int = 3, batch_size: int = 10) -> Dict[str, Any]:
+                              max_concurrent_problems: int = 3, batch_size: int = 10, temperature: float = 0.6, top_logprobs: int = 10, seed: int = 42) -> Dict[str, Any]:
         """
         Evaluate entire AIME dataset with concurrent problem processing
         
@@ -419,17 +515,9 @@ class AIMEEvaluator:
         print(f"Using tail-{tail_n} confidence for selection strategies")
         print(f"Processing {max_concurrent_problems} problems concurrently in batches of {batch_size}")
         print(f"📊 Task Success Metric: # of problems solved correctly out of {len(problems)} total")
-        print(f"🎯 Strategies to evaluate: Random, Standard Confidence (High/Low), Exponential Confidence (High/Low), Oracle")
+        #print(f"🎯 Strategies to evaluate: Random, Standard Confidence (High/Low), Exponential Confidence (High/Low), Oracle")
         
         all_results = []
-        strategy_accuracy = {
-            'random': {'correct': 0, 'total': 0},
-            'highest_confidence': {'correct': 0, 'total': 0},
-            'lowest_confidence': {'correct': 0, 'total': 0},
-            'highest_exp_confidence': {'correct': 0, 'total': 0},  # New strategy
-            'lowest_exp_confidence': {'correct': 0, 'total': 0},   # New strategy
-            'oracle': {'correct': 0, 'total': 0}
-        }
         
         # Process problems in batches
         total_batches = (len(problems) + batch_size - 1) // batch_size
@@ -447,104 +535,242 @@ class AIMEEvaluator:
             # Process current batch concurrently
             try:
                 batch_results = await self.evaluate_problems_batch(
-                    current_batch, n_gen, tail_n, max_concurrent_problems
+                    current_batch, n_gen, tail_n, group_size, max_concurrent_problems, temperature=temperature, top_logprobs=top_logprobs, seed=seed
                 )
                 
-                # Process results from this batch
-                for problem_result in batch_results:
-                    all_results.append(problem_result)
-                    
-                    # Skip if this was an error case
-                    if 'error' in problem_result:
-                        print(f"Skipped problem {problem_result['problem'].problem_id} due to error")
-                        continue
-                    
-                    # Update strategy accuracies
-                    for strategy_name, selected_result in problem_result['strategies'].items():
-                        strategy_accuracy[strategy_name]['total'] += 1
-                        if selected_result.is_correct:
-                            strategy_accuracy[strategy_name]['correct'] += 1
-                    
-                    # Print problem summary with enhanced confidence reporting
-                    problem = problem_result['problem']
-                    print(f"\n✅ Problem {problem.problem_id} Results:")
-                    print(f"  Expected answer: {problem.answer}")
-                    print(f"  Correct generations: {problem_result['n_correct']}/{problem_result['total_generated']}")
-                    
-                    # Show strategy selections with better formatting
-                    correct_strategies = []
-                    incorrect_strategies = []
-                    
-                    for strategy_name, selected_result in problem_result['strategies'].items():
-                        status = "✓" if selected_result.is_correct else "✗"
-                        
-                        # Choose appropriate confidence measure for display
-                        if 'exp_confidence' in strategy_name:
-                            conf_str = f"{selected_result.exp_tail_confidence:.4f}" if selected_result.exp_tail_confidence > 0 else "N/A"
-                        else:
-                            conf_str = f"{selected_result.tail_confidence:.4f}" if selected_result.tail_confidence > 0 else "N/A"
-                            
-                        strategy_info = f"{strategy_name} (ans: {selected_result.extracted_answer}, conf: {conf_str})"
-                        
-                        if selected_result.is_correct:
-                            correct_strategies.append(f"    ✓ {strategy_info}")
-                        else:
-                            incorrect_strategies.append(f"    ✗ {strategy_info}")
-                    
-                    # Display correct strategies first
-                    if correct_strategies:
-                        print("  Strategies that got it RIGHT:")
-                        for strategy in correct_strategies:
-                            print(strategy)
-                    
-                    if incorrect_strategies:
-                        print("  Strategies that got it WRONG:")
-                        for strategy in incorrect_strategies:
-                            print(strategy)
+                all_results.extend(batch_results)
                 
-                # Print batch summary with task-focused metrics
-                batch_problems_solvable = sum(1 for r in batch_results if r.get('n_correct', 0) > 0)
-                
-                # Calculate how many problems each strategy solved in this batch
-                batch_strategy_performance = {}
-                for result in batch_results:
-                    if 'error' not in result:
-                        for strategy_name, selected_result in result['strategies'].items():
-                            if strategy_name not in batch_strategy_performance:
-                                batch_strategy_performance[strategy_name] = 0
-                            if selected_result.is_correct:
-                                batch_strategy_performance[strategy_name] += 1
-                
-                print(f"\n📊 Batch {current_batch_num} Task Performance Summary:")
-                print(f"  Problems with ≥1 correct generation: {batch_problems_solvable}/{len(current_batch)}")
-                
-                if batch_strategy_performance:
-                    print("  Strategy performance in this batch:")
-                    for strategy_name, problems_solved in sorted(batch_strategy_performance.items(), key=lambda x: x[1], reverse=True):
-                        print(f"    {strategy_name.replace('_', ' ').title()}: {problems_solved}/{len(current_batch)} problems")
-                
+                # Print batch summary
+                batch_correct = sum(1 for r in batch_results if r.get('n_correct', 0) > 0)
+                print(f"\nBatch {current_batch_num} complete:")
+                print(f"  Problems with ≥1 correct: {batch_correct}/{len(current_batch)}")
                 
             except Exception as e:
-                print(f"Error processing batch {current_batch_num}: {e}")
+                print(f"Error in batch {current_batch_num}: {e}")
                 continue
         
-        # Calculate final accuracies
-        final_accuracy = {}
-        for strategy, stats in strategy_accuracy.items():
-            if stats['total'] > 0:
-                final_accuracy[strategy] = stats['correct'] / stats['total']
-            else:
-                final_accuracy[strategy] = 0.0
-        
-        return {
-            'problem_results': all_results,
-            'strategy_accuracy': final_accuracy,
+        # Aggregate results
+        dataset_info = {
+            'source': dataset_source,
+            'config': dataset_config,
+            'split': split,
             'total_problems': len(problems),
             'n_gen': n_gen,
             'tail_n': tail_n,
-            'max_concurrent_problems': max_concurrent_problems,
-            'batch_size': batch_size
+            'group_size': group_size
         }
+        
+        # Save strategy-level results
+        strategy_results = ResultsAggregator.aggregate_strategy_results(
+            all_results,
+            dataset_info,
+            self.strategies_file
+        )
+        
+        print(f"\n{'='*80}")
+        print("RESULTS SAVED")
+        print(f"{'='*80}")
+        print(f"Strategy results: {self.strategies_file}")
+        print(f"All response metrics: {self.metrics_file}")
+        print(f"Full choices: {self.choices_dir}/")
+        print(f"{'='*80}\n")
+        
+        return {
+            'problem_results': all_results,
+            'strategy_results': strategy_results,
+            'dataset_info': dataset_info
+        }
+        
+    def _evaluate_problem_worker(self, problem, choices_filename, tail_n, group_size, topk_logprobs=None) -> Dict[str, Any]:
+        """
+        Worker function that runs in separate process.
+        Must be a top-level function or static method for pickling.
+        """
+        # Load choices
+        choices = ChoiceStorage.load_choices(choices_filename)
+        
+        # Evaluate responses
+        results = self.evaluate_responses(problem, choices, tail_n, group_size, topk_logprobs)
+        
+        # Apply selection strategies
+        strategies = self.apply_selection_strategies(results)
+        
+        return {
+            'problem': problem,
+            'results': results,
+            'strategies': strategies,
+            'n_correct': sum(1 for r in results if r.is_correct),
+            'total_generated': len(results)
+        }
+    
+    async def evaluate_dataset_offline(self, dataset_source: str, stored_choices_dir: str, topk_logprobs: Optional[int] = None, tail_n: int = 2048, 
+                                   group_size: int = 1024, split: str = 'train', 
+                                   max_concurrent_problems: int = 30) -> Dict[str, Any]:
+        """
+        Evaluate entire AIME dataset based on generated choices already stored on disk.
+        All problems are processed in parallel with controlled concurrency.
+        
+        Args:
+            dataset_source: HF dataset name or local file path
+            stored_choices_dir: Directory containing stored choices
+            tail_n: Tail confidence window size
+            group_size: Group size for evaluation
+            split: Dataset split to use
+            max_concurrent_problems: Maximum number of problems to process concurrently
+        """
+        
+        problems = self.load_aime_dataset(dataset_source, None, split)
+        
+        print(f"Loaded {len(problems)} problems for task evaluation")
+        print(f"Using tail-{tail_n} confidence for selection strategies")
+        print(f"Processing up to {max_concurrent_problems} problems concurrently")
+        print(f"📊 Task Success Metric: # of problems solved correctly out of {len(problems)} total")
+        
+        # Use ProcessPoolExecutor for CPU-bound work
+        num_workers = min(max_concurrent_problems, os.cpu_count() or 1)
+        print(f"Using {num_workers} worker processes")
+        
+        # Progress tracking
+        completed = {'count': 0}
+        completed_lock = asyncio.Lock()
+        
+        # Create process pool
+        loop = asyncio.get_event_loop()
+        executor = ProcessPoolExecutor(max_workers=num_workers)
+        
+        try:
+            async def evaluate_single_problem_offline(problem, idx):
+                """Evaluate a single problem with stored choices"""
+                try:
+                    print(f"\n[{idx + 1}/{len(problems)}] Starting evaluation for Problem {problem.problem_id}")
+                    
+                    choices_filename = os.path.join(stored_choices_dir, f"{problem.problem_id}_choices.pkl")
+                    
+                    # Run entire evaluation in process pool
+                    result = await loop.run_in_executor(
+                        executor,
+                        self._evaluate_problem_worker,
+                        problem, choices_filename, tail_n, group_size, topk_logprobs
+                    )
+                    
+                    async with completed_lock:
+                        completed['count'] += 1
+                        n_correct = result['n_correct']
+                        status = "✓ HAS CORRECT" if n_correct > 0 else "✗ NO CORRECT"
+                        print(f"[{completed['count']}/{len(problems)}] Completed Problem {problem.problem_id}: {n_correct}/{result['total_generated']} correct - {status}")
+                    
+                    return result
+                    
+                except Exception as e:
+                    print(f"Error evaluating problem {problem.problem_id}: {e}")
+                    async with completed_lock:
+                        completed['count'] += 1
+                    return {
+                        'problem': problem,
+                        'error': str(e),
+                        'n_correct': 0,
+                        'total_generated': 0
+                    }
+            
+            # Create tasks for all problems
+            tasks = [
+                evaluate_single_problem_offline(problem, idx)
+                for idx, problem in enumerate(problems)
+            ]
+            
+            print(f"\n{'='*60}")
+            print(f"Starting parallel evaluation of all {len(problems)} problems...")
+            print(f"{'='*60}\n")
+            
+            # Run all tasks concurrently
+            all_results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+        finally:
+            # Clean up executor
+            executor.shutdown(wait=True)
+        
+        # Filter out exceptions
+        valid_results = []
+        for i, result in enumerate(all_results):
+            if isinstance(result, Exception):
+                print(f"Exception in problem {i}: {result}")
+                valid_results.append({
+                    'problem': problems[i],
+                    'error': str(result),
+                    'n_correct': 0,
+                    'total_generated': 0
+                })
+            else:
+                valid_results.append(result)
+        
+        # Print final summary
+        total_correct = sum(1 for r in valid_results if r.get('n_correct', 0) > 0)
+        total_responses = sum(r.get('total_generated', 0) for r in valid_results)
+        print(f"\n{'='*80}")
+        print(f"EVALUATION COMPLETE")
+        print(f"{'='*80}")
+        print(f"Total problems: {len(problems)}")
+        print(f"Problems with ≥1 correct: {total_correct}/{len(problems)}")
+        print(f"Total responses evaluated: {total_responses}")
+        print(f"{'='*80}\n")
+        
+        # Aggregate results
+        dataset_info = {
+            'source': dataset_source,
+            'split': split,
+            'total_problems': len(problems),
+            'tail_n': tail_n,
+            'group_size': group_size,
+        }
+        
+        # Save strategy-level results
+        strategy_results = ResultsAggregator.aggregate_strategy_results(
+            valid_results,
+            dataset_info,
+            self.strategies_file
+        )
+        
+        print(f"\n{'='*80}")
+        print("RESULTS SAVED")
+        print(f"{'='*80}")
+        print(f"Strategy results: {self.strategies_file}")
+        print(f"All response metrics: {self.metrics_file}")
+        print(f"Full choices: {self.choices_dir}/")
+        print(f"{'='*80}\n")
+        
+        return {
+            'problem_results': valid_results,
+            'strategy_results': strategy_results,
+            'dataset_info': dataset_info
+        }
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="AIME Evaluator Configuration")
+    
+    # Dataset
+    parser.add_argument("--dataset_source", type=str, default="MathArena/aime_2025")
+    parser.add_argument("--dataset_config", type=str, default=None)
+    parser.add_argument("--split", type=str, default="train")
+    
+    # Generation
+    parser.add_argument("--n_gen", type=int, default=5)
+    parser.add_argument("--tail_n", type=int, default=512)
+    parser.add_argument("--group_size", type=int, default=1024)
+    parser.add_argument("--temperature", type=float, default=0.6)
+    parser.add_argument("--top_logprobs", type=int, default=10)
+    parser.add_argument("--streaming", action='store_true', help="Enable streaming generation")
+    
+    # Performance
+    parser.add_argument("--max_concurrent", type=int, default=3)
+    parser.add_argument("--batch_size", type=int, default=10)
+    
+    # Output
+    parser.add_argument("--turn", type=int, default=1)
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--output_dir", type=str, default="./outputs")
+    parser.add_argument("--seed", type=int, default=42)
+    
+    return parser.parse_args()
 
 async def main():
     print("AIME 2025 Evaluation Script")
@@ -554,63 +780,20 @@ async def main():
         print("⚠️  Hugging Face datasets not available. Install with: pip install datasets")
         print("Falling back to local JSON file support only.\n")
     
-    # Dataset configuration
-    print("\nDataset Options:")
-    print("1. Hugging Face dataset (e.g., 'AI-MO/aimo-validation-aime', 'hendrycks/competition_math')")
-    print("2. Local JSON file path")
-    print("3. Press Enter for sample data")
+    args = parse_args()
     
-    dataset_source = input("\nEnter dataset source: ").strip()
-    if not dataset_source:
-        dataset_source = "MathArena/aime_2025"
+    # Setup output directory
+    dataset_name = args.dataset_source.replace('/', '_').replace('.json', '')
+    output_dir = os.path.join(args.output_dir, dataset_name, f'turn{args.turn}')
+    os.makedirs(output_dir, exist_ok=True)
     
-    dataset_config = None
-    split = "train"
-    
-    # If it's a HF dataset, ask for additional configuration
-    if HF_AVAILABLE and not dataset_source.endswith('.json') and dataset_source != "sample":
-        dataset_config = input("Enter dataset configuration (optional, press Enter to skip): ").strip()
-        if not dataset_config:
-            dataset_config = None
-            
-        split_input = input("Enter dataset split (default: test): ").strip()
-        if split_input:
-            split = split_input
-    
-    # Generation configuration
-    try:
-        n_gen = int(input("Enter number of generations per problem (default 5): ") or "5")
-    except ValueError:
-        n_gen = 5
-    
-    try:
-        tail_n = int(input("Enter tail confidence window (default 2048): ") or "2048")
-    except ValueError:
-        tail_n = 2048
-    
-    # Concurrency configuration
-    print("\n🚀 Performance Configuration:")
-    try:
-        max_concurrent = int(input("Max concurrent problems (default 3, higher = faster but more API load): ") or "3")
-    except ValueError:
-        max_concurrent = 5
-    
-    try:
-        batch_size = int(input("Batch size for processing (default 10): ") or "10")
-    except ValueError:
-        batch_size = 10
-    
-    print(f"\n⚡ Performance Settings:")
-    print(f"  • {max_concurrent} problems will be processed simultaneously")
-    print(f"  • Processing in batches of {batch_size} problems")
-    print(f"  • Each problem generates {n_gen} responses concurrently")
-    print(f"  • Total concurrent API calls per batch: up to {max_concurrent * n_gen}")
+    print(f"\nOutput directory: {output_dir}")
     
     # Initialize client
     client = openai.AsyncOpenAI(
-        base_url="http://localhost:8000/v1",
-        api_key="token-abc123",
-        timeout=30 * 60,
+        base_url=f"http://localhost:{args.port}/v1",
+        api_key="token-abc",
+        timeout=30 * 60 * 2,
     )
     
     # Get model
@@ -619,7 +802,7 @@ async def main():
     print(f"Using model: {model_id}")
     
     # Initialize evaluator
-    evaluator = AIMEEvaluator(client, model_id)
+    evaluator = AIMEEvaluator(client, model_id, output_dir, streaming=args.streaming)
     
     # Run evaluation
     print("\n" + "="*80)
@@ -631,147 +814,36 @@ async def main():
     start_time = time.time()
     
     results = await evaluator.evaluate_dataset(
-        dataset_source=dataset_source, 
-        n_gen=n_gen, 
-        tail_n=tail_n,
-        dataset_config=dataset_config,
-        split=split,
-        max_concurrent_problems=max_concurrent,
-        batch_size=batch_size
+        dataset_source=args.dataset_source,
+        n_gen=args.n_gen,
+        tail_n=args.tail_n,
+        group_size=args.group_size,
+        dataset_config=args.dataset_config,
+        split=args.split,
+        max_concurrent_problems=args.max_concurrent,
+        batch_size=args.batch_size,
+        temperature=args.temperature,
+        seed=args.seed
     )
     
     end_time = time.time()
     execution_time = end_time - start_time
     
-    # Calculate task-level metrics
-    total_generations = sum(pr.get('total_generated', 0) for pr in results['problem_results'])
-    total_correct_generations = sum(pr.get('n_correct', 0) for pr in results['problem_results'])
-    generation_accuracy = total_correct_generations/total_generations if total_generations > 0 else 0.0
-    
-    # Count problems that had at least one correct generation (solvability)
-    problems_with_correct_solutions = sum(1 for pr in results['problem_results'] if pr.get('n_correct', 0) > 0)
-    solvability_rate = problems_with_correct_solutions / results['total_problems'] if results['total_problems'] > 0 else 0.0
-
-    # Print final results
+    # Print final summary
     print("\n" + "="*80)
-    print("FINAL AIME 2025 TASK PERFORMANCE RESULTS")
+    print("EVALUATION COMPLETE")
     print("="*80)
-    print(f"Dataset source: {dataset_source}")
-    if dataset_config:
-        print(f"Dataset config: {dataset_config}")
-    print(f"Dataset split: {split}")
-    print(f"Total problems in task: {results['total_problems']}")
-    print(f"Generations per problem: {results['n_gen']}")
-    print(f"Tail confidence window: {results['tail_n']}")
-    print(f"Max concurrent problems: {results['max_concurrent_problems']}")
-    print(f"Batch size: {results['batch_size']}")
-    print(f"⏱️  Total execution time: {execution_time:.1f} seconds ({execution_time/60:.1f} minutes)")
-    if results['total_problems'] > 0:
-        print(f"⚡ Average time per problem: {execution_time/results['total_problems']:.1f} seconds")
-    print()
+    print(f"Total time: {execution_time:.1f}s ({execution_time/60:.1f} min)")
+    print(f"Problems evaluated: {results['dataset_info']['total_problems']}")
     
-    print("📊 TASK ACCURACY - Problems Solved Correctly by Strategy:")
-    print("="*60)
+    strategy_results = results['strategy_results']['strategy_results']
+    if strategy_results:
+        best = max(strategy_results.items(), key=lambda x: x[1]['accuracy'])
+        print(f"\nBest strategy: {best[0]}")
+        print(f"  Accuracy: {best[1]['accuracy']:.2%}")
+        print(f"  Correct: {best[1]['correct']}/{best[1]['total']}")
     
-    # Get strategy results with counts
-    strategy_results = []
-    for strategy_name, accuracy in results['strategy_accuracy'].items():
-        problems_solved = int(accuracy * results['total_problems']) if results['total_problems'] > 0 else 0
-        strategy_results.append((strategy_name, accuracy, problems_solved))
-    
-    # Sort by accuracy for better display
-    strategy_results.sort(key=lambda x: x[1], reverse=True)
-    
-    print("Standard Confidence Strategies:")
-    for strategy_name, accuracy, problems_solved in strategy_results:
-        if strategy_name in ['random', 'highest_confidence', 'lowest_confidence', 'oracle']:
-            print(f"  {strategy_name.replace('_', ' ').title():<20}: {problems_solved:>2}/{results['total_problems']:<2} = {accuracy:.2%}")
-    
-    print("\nExponential Confidence Strategies:")
-    for strategy_name, accuracy, problems_solved in strategy_results:
-        if strategy_name in ['highest_exp_confidence', 'lowest_exp_confidence']:
-            print(f"  {strategy_name.replace('_', ' ').title():<20}: {problems_solved:>2}/{results['total_problems']:<2} = {accuracy:.2%}")
-    
-    # Find best performing strategies
-    best_strategy = max(strategy_results, key=lambda x: x[1])
-    print(f"\n🏆 Best Strategy: {best_strategy[0].replace('_', ' ').title()} - {best_strategy[2]}/{results['total_problems']} problems ({best_strategy[1]:.2%})")
-    
-    print("\n📈 Generation-Level Analysis (Supplementary):")
-    print("="*60)
-    print(f"  Problems with ≥1 correct solution: {problems_with_correct_solutions}/{results['total_problems']} ({solvability_rate:.2%})")
-    print(f"  Total generations produced: {total_generations}")
-    print(f"  Total correct generations: {total_correct_generations}")
-    print(f"  Generation-level accuracy: {generation_accuracy:.2%}")
-    
-    # Performance metrics
-    if total_generations > 0:
-        print(f"  Generations per second: {total_generations/execution_time:.1f}")
-        print(f"  API efficiency: {total_generations} total calls in {execution_time:.1f}s")
-    
-    # Save results with comprehensive metrics
-    dataset_name = dataset_source.replace('/', '_').replace('.json', '')
-    output_file = f"aime_results_{dataset_name}_n{n_gen}_c{max_concurrent}_b{batch_size}_tail{tail_n}.json"
-    
-    # Calculate strategy performance details
-    strategy_details = {}
-    for strategy_name, accuracy in results['strategy_accuracy'].items():
-        problems_solved = int(accuracy * results['total_problems']) if results['total_problems'] > 0 else 0
-        strategy_details[strategy_name] = {
-            'problems_solved': problems_solved,
-            'total_problems': results['total_problems'],
-            'task_accuracy': accuracy,
-            'strategy_type': 'exponential_confidence' if 'exp_confidence' in strategy_name else 'standard_confidence'
-        }
-    
-    with open(output_file, 'w') as f:
-        # Convert results to JSON-serializable format with task-focused metrics
-        json_results = {
-            'dataset_info': {
-                'source': dataset_source,
-                'config': dataset_config,
-                'split': split,
-                'total_problems': results['total_problems']
-            },
-            'experiment_config': {
-                'n_gen': results['n_gen'],
-                'tail_n': results['tail_n'],
-                'max_concurrent_problems': results['max_concurrent_problems'],
-                'batch_size': results['batch_size'],
-                'execution_time_seconds': execution_time
-            },
-            'task_performance': {
-                'strategy_details': strategy_details,
-                'best_strategy': {
-                    'name': best_strategy[0],
-                    'problems_solved': best_strategy[2],
-                    'task_accuracy': best_strategy[1]
-                },
-                'solvability_analysis': {
-                    'problems_with_correct_solutions': problems_with_correct_solutions,
-                    'solvability_rate': solvability_rate
-                }
-            },
-            'generation_analysis': {
-                'total_api_calls': total_generations,
-                'total_correct_generations': total_correct_generations,
-                'generation_accuracy': generation_accuracy,
-                'calls_per_second': total_generations/execution_time if execution_time > 0 else 0,
-                'avg_time_per_problem': execution_time/results['total_problems'] if results['total_problems'] > 0 else 0
-            }
-        }
-        json.dump(json_results, f, indent=2)
-    
-    print(f"\nResults saved to: {output_file}")
-    
-    # Print some popular dataset suggestions for future use
-    print("\n" + "="*80)
-    print("POPULAR AIME/MATH DATASETS ON HUGGING FACE:")
-    print("="*80)
-    print("• AI-MO/aimo-validation-aime - AIME validation problems")
-    print("• hendrycks/competition_math - Competition mathematics problems")
-    print("• lighteval/MATH - Mathematical reasoning dataset")
-    print("• AI-MO/NuminaMath-CoT - Mathematical problems with chain-of-thought")
-    print("• microsoft/orca-math-word-problems-200k - Mathematical word problems")
+    print(f"\n📁 Results saved to: {output_dir}")
     print("="*80)
 
 if __name__ == "__main__":
