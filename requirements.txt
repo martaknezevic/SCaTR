@@ -1,0 +1,22 @@
+# Requirements for Modular Math Evaluator
+
+# Core dependencies
+openai>=1.0.0
+numpy>=1.24.0
+pyyaml>=6.0
+
+# Dataset loading
+datasets>=2.14.0
+
+# File locking for concurrent writes
+filelock>=3.12.0
+
+# Math grading (symbolic evaluation)
+sympy>=1.12
+pylatexenc>=2.10
+
+# Optional: For better performance
+# torch>=2.0.0  # If using local models
+
+wandb
+jsonlines

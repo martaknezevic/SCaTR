@@ -1,0 +1,42 @@
+# Configuration for AIME (American Invitational Mathematics Examination) Dataset
+# AIME problems require integer answers from 0 to 999
+
+dataset:
+  source: "MathArena/aime_2025"  # HuggingFace dataset or local JSON path
+  split: "train"                  # Dataset split: train, test, validation
+  loader_type: "aime"             # Loader type: aime, math, gsm8k, generic
+
+answer_handling:
+  extractor_type: "aime"          # Extractor: aime, math, gsm8k, generic
+  grader_type: "exact_match"      # Grader: exact_match, math_grader
+  grader_params: {}               # Additional grader parameters
+
+generation:
+  n_gen: 32                       # Number of responses to generate per problem
+  temperature: 0.6                # Sampling temperature (0.0 = greedy, higher = more random)
+  top_logprobs: 10                # Number of top logprobs to return per token
+  streaming: false                # Enable streaming generation
+  system_prompt: |
+    You are solving an AIME (American Invitational Mathematics Examination) problem. 
+    Show your work step by step and provide your final numerical answer clearly. 
+    AIME answers are integers from 0 to 999.
+
+evaluation:
+  tail_n: 2048                    # Window size for tail confidence metrics
+  group_size: 1024                # Group size for group-based metrics aggregation
+
+performance:
+  max_concurrent: 3               # Maximum number of problems to evaluate concurrently
+  batch_size: 10                  # Number of problems per batch
+
+output:
+  output_dir: "./outputs/aime"    # Base output directory
+  choices_dir: "choices"          # Subdirectory for storing full choices
+  metrics_file: "all_response_metrics.jsonl"  # File for response-level metrics
+  strategies_file: "strategy_results.json"    # File for strategy-level results
+
+openai:
+  model_id: null                  # Model ID (auto-detected if null)
+  base_url: "http://localhost:8000/v1"  # OpenAI-compatible API endpoint
+  api_key: "token-abc"            # API key
+  timeout: 3600                   # Request timeout in seconds
