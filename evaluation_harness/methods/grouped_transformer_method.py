@@ -434,19 +434,17 @@ class GroupedTransformerMethod(BaseMethod):
                 epoch_loss += batch_loss
                 epoch_attn_l1 += batch_attn_l1
 
-            # Evaluate on training and validation sets
-            train_acc = self._evaluate_accuracy(train_problems)
+            # Evaluate on validation set only
             val_acc = self._evaluate_accuracy(val_problems if val_problems else train_problems)
             val_loss = self._evaluate_loss(val_problems if val_problems else train_problems)
 
             history['train_loss'].append(epoch_loss)
             history['train_attn_l1'].append(epoch_attn_l1)
-            history['train_acc'].append(train_acc)
             history['val_acc'].append(val_acc)
             history['val_loss'].append(val_loss)
 
             print(f"Epoch {epoch}/{self.num_epochs} - train_loss={epoch_loss:.4f} "
-                  f"train_attn_l1={epoch_attn_l1:.4f} train_acc={train_acc:.4f} val_acc={val_acc:.4f} val_loss={val_loss:.4f}")
+                  f"train_attn_l1={epoch_attn_l1:.4f} val_acc={val_acc:.4f} val_loss={val_loss:.4f}")
             sys.stdout.flush()
             
             # Log to wandb if enabled
@@ -457,7 +455,6 @@ class GroupedTransformerMethod(BaseMethod):
                         'epoch': epoch,
                         'train_loss': epoch_loss,
                         'train_attn_l1': epoch_attn_l1,
-                        'train_acc': train_acc,
                         'val_loss': val_loss,
                         'val_acc': val_acc
                     })
