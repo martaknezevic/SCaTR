@@ -1,0 +1,61 @@
+# Base configuration for hyperparameter search
+# This config should have exactly ONE method to tune
+
+# Data configuration
+data:
+  train_data_path: "/efs/cactts/data/Qwen8b/kodcode/turn1"
+  external_test_data_paths: 
+    - "/efs/cactts/data/Qwen8b/humaneval_v2/turn1"
+  
+  num_problems: null
+  num_workers: 32
+  num_choice_workers: 8
+  use_cache: true
+  cache_dir: "cache"
+  subsample_size: null
+  
+  num_train_problems: 700
+  num_val_problems: 150
+  num_test_problems: 150
+  random_seed: 42
+  
+  tail_tokens: 2048
+
+# Single method to tune (hyperparameters will be overridden by search script)
+methods:
+  - name: dct_nn
+    params:
+      K: 128  # Number of DCT coefficients to extract
+      hidden_dim: 128  # Hidden dimension for neural network
+      dropout: 0.1  # Dropout rate
+      num_epochs: 100  # Number of training epochs
+      lr: 0.001  # Learning rate
+      weight_decay: 0.01  # L2 regularization weight
+      batch_problems: 8  # Number of problems per gradient update
+      margin: 1.0  # Margin for hinge loss
+      patience: 10  # Early stopping patience
+      early_stop_metric: "val_acc"  # Metric for early stopping: "val_acc" or "val_loss"
+      tail_tokens: 2048  # Number of tail tokens to use before DCT
+      seed: 42  # Random seed for weight initialization
+      loss_type: "bce"  # Loss type: "hinge" or "bce"
+      use_weighted_loss: false  # Use weighted loss based on pos/neg ratio
+      normalize_dct: true  # Remove DC bias (mean) before applying DCT
+      choice_logprobs: "mean"  # Choice of logprobs: "top1" or "mean"
+      window_size: 128  # Window size for avg mean confidence calculation
+
+# Output configuration
+output:
+  base_dir: "outputs/hyper_search"
+  save_predictions: true
+  save_models: true
+  save_metrics: true
+
+# Evaluation settings
+evaluation: "code"
+device: "cuda"
+
+# WandB configuration (will be overridden by search script)
+wandb:
+  enabled: true
+  project: "cactts-hyps-code-transformer"
+  entity: null

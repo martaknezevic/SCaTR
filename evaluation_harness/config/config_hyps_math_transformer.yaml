@@ -1,0 +1,63 @@
+# Base configuration for hyperparameter search
+# This config should have exactly ONE method to tune
+
+# Data configuration
+data:
+  train_data_path: "/efs/cactts/data/Qwen8b/gsm8k/turn1"
+  external_test_data_paths: 
+    - "/efs/cactts/data/Qwen8b/math500/turn1"
+    - "/efs/cactts/data/Qwen8b/aime/GY2233_AIME-2024-2025/turn1/2025"
+  
+  num_problems: null
+  num_workers: 32
+  num_choice_workers: 8
+  use_cache: true
+  cache_dir: "cache"
+  subsample_size: null
+  
+  num_train_problems: 700
+  num_val_problems: 150
+  num_test_problems: 150
+  random_seed: 42
+  
+  tail_tokens: 2048
+
+# Single method to tune (hyperparameters will be overridden by search script)
+methods:
+  - name: transformer
+    params:
+      d_model: 128
+      nhead: 4
+      num_layers: 2
+      mlp_hidden: 64
+      dropout: 0.1  # Will be overridden
+      num_epochs: 100
+      lr: 0.001  # Will be overridden
+      batch_problems: 8
+      margin: 1.0
+      attention_l1_weight: 0.01 # Will be overridden
+      patience: 10
+      early_stop_metric: "val_acc"  # Will be overridden
+      use_projection: true
+      tail_tokens: 2048
+      seed: 42
+      loss_type: "hinge"  # Will be overridden
+      use_weighted_loss: false
+      weight_decay: 0.0  # Will be overridden
+
+# Output configuration
+output:
+  base_dir: "outputs/hyper_search"
+  save_predictions: true
+  save_models: true
+  save_metrics: true
+
+# Evaluation settings
+evaluation: "math"
+device: "cuda"
+
+# WandB configuration (will be overridden by search script)
+wandb:
+  enabled: true
+  project: "cactts-hyps-math-transformer"
+  entity: null
