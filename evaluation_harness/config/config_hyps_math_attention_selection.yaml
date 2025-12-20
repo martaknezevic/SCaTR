@@ -1,11 +1,12 @@
-# Base configuration for hyperparameter search
+# Base configuration for attention selection on math tasks
 # This config should have exactly ONE method to tune
 
 # Data configuration
 data:
-  train_data_path: "/efs/cactts/data/Qwen8b/kodcode/turn1"
+  train_data_path: "/efs/cactts/data/Qwen8b/gsm8k/turn1"
   external_test_data_paths: 
-    - "/efs/cactts/data/Qwen8b/humaneval_v2/turn1"
+    - "/efs/cactts/data/Qwen8b/math500/turn1"
+    - "/efs/cactts/data/Qwen8b/aime/GY2233_AIME-2024-2025/turn1/2025"
   
   num_problems: null
   num_workers: 32
@@ -13,7 +14,7 @@ data:
   use_cache: true
   cache_dir: "cache"
   subsample_size: null
-  
+
   num_train_problems: 700
   num_val_problems: 150
   num_test_problems: 150
@@ -23,27 +24,37 @@ data:
 
 # Single method to tune (hyperparameters will be overridden by search script)
 methods:
-  - name: grouped_transformer
+  - name: attention_selection
     params:
+      # Model architecture
       d_model: 128
-      nhead: 1
+      nhead: 4
       num_layers: 2
-      mlp_hidden: 64
       dropout: 0.1  # Will be overridden
+      use_projection: true
+      use_both_layers: true  # Will be overridden
+      
+      # Token selection parameters
+      k: 10  # Will be overridden
+      temperature: 1.0  # Will be overridden
+      
+      # Training parameters
       num_epochs: 100
       lr: 0.001  # Will be overridden
       batch_problems: 8
       margin: 1.0
       patience: 10
       early_stop_metric: "val_acc"  # Will be overridden
-      use_projection: true
+      
+      # Loss weights
+      sparsity_lambda: 0.001  # Will be overridden
+      
+      # Optional parameters
       tail_tokens: 2048
       seed: 42
       loss_type: "hinge"  # Will be overridden
       use_weighted_loss: false
       weight_decay: 0.0  # Will be overridden
-      window_size: 256  
-      attention_l1_weight: 0.0
 
 # Output configuration
 output:
@@ -53,11 +64,11 @@ output:
   save_metrics: true
 
 # Evaluation settings
-evaluation: "code"
+evaluation: "math"
 device: "cuda"
 
 # WandB configuration (will be overridden by search script)
 wandb:
   enabled: true
-  project: "cactts-hyps-code-grouped-transformer"
+  project: "cactts-hyps-math-attention-selection"
   entity: null

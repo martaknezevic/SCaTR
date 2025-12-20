@@ -1,0 +1,82 @@
+# Simple configuration for testing attention selection method
+# For quick experiments and debugging
+
+# Data configuration
+data:
+  train_data_path: "/efs/cactts/data/Qwen8b/kodcode/turn1"
+  external_test_data_paths: 
+    - "/efs/cactts/data/Qwen8b/humaneval_v2/turn1"
+  
+  num_problems: null
+  num_workers: 16
+  num_choice_workers: 8
+  use_cache: true
+  cache_dir: "cache"
+  subsample_size: 8
+  
+  num_train_problems: 700
+  num_val_problems: 150
+  num_test_problems: 150
+  random_seed: 42
+  
+  tail_tokens: 2048
+
+# Methods
+methods:
+  - name: random
+    params:
+      num_trials: 10  # Number of random trials to average over
+  
+  - name: oracle
+    params: {}
+  
+  - name: uniform
+    params: {}
+  - name: attention_selection
+    params:
+      # Model architecture
+      d_model: 64
+      nhead: 2
+      num_layers: 2
+      dropout: 0.1
+      use_projection: true
+      use_both_layers: true
+      
+      # Token selection parameters
+      k: 10
+      temperature: 1.0
+      
+      # Training parameters
+      num_epochs: 20
+      lr: 0.001
+      batch_problems: 4
+      margin: 1.0
+      patience: 10
+      early_stop_metric: "val_acc"
+      
+      # Loss weights
+      sparsity_lambda: 0.001
+      
+      # Optional parameters
+      tail_tokens: 2048
+      seed: 42
+      loss_type: "hinge"
+      use_weighted_loss: false
+      weight_decay: 0.0
+
+# Output configuration
+output:
+  base_dir: "outputs/test_attention_selection"
+  save_predictions: true
+  save_models: true
+  save_metrics: true
+
+# Evaluation settings
+evaluation: "code"
+device: "cuda"
+
+# WandB configuration
+wandb:
+  enabled: false
+  project: "cactts-test"
+  entity: null

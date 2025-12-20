@@ -1,4 +1,4 @@
-# Base configuration for hyperparameter search
+# Base configuration for attention selection hyperparameter search
 # This config should have exactly ONE method to tune
 
 # Data configuration
@@ -23,27 +23,37 @@ data:
 
 # Single method to tune (hyperparameters will be overridden by search script)
 methods:
-  - name: grouped_transformer
+  - name: attention_selection
     params:
+      # Model architecture
       d_model: 128
-      nhead: 1
+      nhead: 4
       num_layers: 2
-      mlp_hidden: 64
       dropout: 0.1  # Will be overridden
+      use_projection: true
+      use_both_layers: true  # Will be overridden
+      
+      # Token selection parameters
+      k: 10  # Will be overridden
+      temperature: 1.0  # Will be overridden
+      
+      # Training parameters
       num_epochs: 100
       lr: 0.001  # Will be overridden
       batch_problems: 8
       margin: 1.0
       patience: 10
       early_stop_metric: "val_acc"  # Will be overridden
-      use_projection: true
+      
+      # Loss weights
+      sparsity_lambda: 0.001  # Will be overridden
+      
+      # Optional parameters
       tail_tokens: 2048
       seed: 42
       loss_type: "hinge"  # Will be overridden
       use_weighted_loss: false
       weight_decay: 0.0  # Will be overridden
-      window_size: 256  
-      attention_l1_weight: 0.0
 
 # Output configuration
 output:
@@ -59,5 +69,5 @@ device: "cuda"
 # WandB configuration (will be overridden by search script)
 wandb:
   enabled: true
-  project: "cactts-hyps-code-grouped-transformer"
+  project: "cactts-hyps-code-attention-selection"
   entity: null

@@ -27,7 +27,7 @@ methods:
   - name: grouped_transformer
     params:
       d_model: 128
-      nhead: 4
+      nhead: 1
       num_layers: 2
       mlp_hidden: 64
       dropout: 0.1  # Will be overridden

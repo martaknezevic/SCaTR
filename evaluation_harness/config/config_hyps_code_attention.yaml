@@ -25,24 +25,34 @@ data:
 methods:
   - name: attention_matrix
     params:
-      d_model: 128
-      nhead: 4
+      # Architecture parameters
+      hidden_dim: 128
+      nheads: 4
       num_layers: 2
       dropout: 0.1  # Will be overridden
-      num_epochs: 100
-      lr: 0.001  # Will be overridden
-      batch_problems: 8
-      margin: 1.0
-      patience: 10
-      early_stop_metric: "val_acc"  # Will be overridden
+      top_k: 10  # Will be overridden - number of top attention positions to extract
+      metric_hidden_dim: 64
+      
+      # Stage 1 training parameters
+      stage1_lr: 0.001  # Will be overridden
+      stage1_weight_decay: 0.0001  # Will be overridden
+      stage1_epochs: 50
+      stage1_patience: 10
+      stage1_early_stopping_metric: "val_acc"
+      
+      # Stage 2 training parameters
+      stage2_lr: 0.0005  # Will be overridden
+      stage2_weight_decay: 0.0001  # Will be overridden
+      stage2_epochs: 50
+      stage2_patience: 10
+      stage2_early_stopping_metric: "val_acc"
+      
+      # Common parameters
+      batch_size: 32
+      loss_type: "bce"  # Will be overridden - 'bce' or 'hinge'
+      margin: 1.0  # Margin for hinge loss
       tail_tokens: 2048
-      seed: 42
-      loss_type: "hinge"  # Will be overridden
-      use_weighted_loss: false
-      weight_decay: 0.0  # Will be overridden
-      k: 10  # Will be overridden - number of top attention positions to extract
-      stage1_epochs: 50  # Epochs for stage 1 (encoder training)
-      stage2_epochs: 50  # Epochs for stage 2 (metric learner training)
+      device: "cuda"
 
 # Output configuration
 output:
