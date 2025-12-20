@@ -1,0 +1,43 @@
+# Hyperparameter search configuration for Transformer method on code evaluation
+# This config specifies the hyperparameter grid for transformer method
+
+# Base config to use for each run
+base_config: config_hyps_code_transformer
+
+# Method to search (must match method name in base config)
+method_name: transformer
+
+# WandB configuration
+wandb:
+  project: cactts-hyps-code-transformer2
+  entity: null  # Set your wandb entity if needed
+  enabled: true
+
+# CUDA device to use
+cuda_device: 0
+
+# Hyperparameter grid
+# Each parameter should be a list of values to try
+hyperparameters:
+  lr: [0.005, 0.001, 0.0005, 0.0001]
+  
+  dropout: [0.0, 0.1, 0.2]
+  
+  weight_decay: [0.0, 0.0001, 0.001]
+  
+  loss_type: [hinge, bce]
+  
+  early_stop_metric: [val_acc]
+
+  attention_l1_weight: [0.0, 0.1]
+  
+  # Uncomment to search over these parameters
+  # d_model: [64, 128, 256]
+  # num_layers: [2, 3, 4]
+  # batch_problems: [4, 8, 16]
+  # margin: [0.5, 1.0, 2.0]  # Only for hinge loss
+
+# Search strategy
+search_strategy: grid  # Options: grid, random
+max_trials: null  # Set to limit number of trials (null = try all combinations)
+random_seed: 42
