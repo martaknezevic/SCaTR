@@ -301,7 +301,7 @@ class CLSAttentionTopKMetricMethod(BaseMethod):
     
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
-        
+        print(config)
         # Architecture parameters
         self.hidden_dim = config.get('hidden_dim', 128)
         self.num_heads = config.get('num_heads', 4)
@@ -314,18 +314,20 @@ class CLSAttentionTopKMetricMethod(BaseMethod):
         self.stage1_lr = config.get('stage1_lr', 0.001)
         self.stage1_weight_decay = config.get('stage1_weight_decay', 0.0001)
         self.stage1_epochs = config.get('stage1_epochs', 10)
-        self.stage1_patience = config.get('stage1_patience', 3)
+        self.stage1_patience = config.get('stage1_patience', 10)
         self.stage1_early_stopping_metric = config.get('stage1_early_stopping_metric', 'val_acc')  # 'val_acc' or 'val_loss'
         
         # Training parameters - Stage 2 (metric learner)
         self.stage2_lr = config.get('stage2_lr', 0.0005)
         self.stage2_weight_decay = config.get('stage2_weight_decay', 0.0001)
         self.stage2_epochs = config.get('stage2_epochs', 10)
-        self.stage2_patience = config.get('stage2_patience', 3)
+        self.stage2_patience = config.get('stage2_patience', 10)
         self.stage2_early_stopping_metric = config.get('stage2_early_stopping_metric', 'val_acc')  # 'val_acc' or 'val_loss'
         
         # Common training parameters
         self.batch_size = config.get('batch_size', 32)
+        self.loss_type = config.get('loss_type', 'bce')  # 'bce' or 'hinge'
+        self.margin = config.get('margin', 1.0)  # Margin for hinge loss
         
         # Data parameters
         self.tail_tokens = config.get('tail_tokens', None)
@@ -349,6 +351,31 @@ class CLSAttentionTopKMetricMethod(BaseMethod):
             logprobs = logprobs[-self.tail_tokens:]
         
         return logprobs
+    
+    def _preload_data_to_gpu(self, data: List[Dict]) -> List[Dict]:
+        """Pre-load all logprobs to GPU as tensors to avoid repeated CPU-GPU transfers."""
+        print(f"Pre-loading {len(data)} items to GPU...")
+        sys.stdout.flush()
+        
+        preloaded_data = []
+        for item in data:
+            features = self._extract_features(item)
+            
+            if features.size == 0:
+                continue
+            
+            # Convert to GPU tensor immediately
+            tensor = torch.tensor(features, dtype=torch.float32, device=self.device)
+            
+            preloaded_item = item.copy()
+            preloaded_item['logprobs_tensor'] = tensor
+            preloaded_item['seq_len'] = tensor.shape[0]
+            preloaded_data.append(preloaded_item)
+        
+        print(f"✓ Pre-loaded data to GPU")
+        sys.stdout.flush()
+        
+        return preloaded_data
     
     def _create_transformer(self, input_dim: int) -> TransformerEncoder:
         """Create transformer encoder."""
@@ -425,7 +452,7 @@ class CLSAttentionTopKMetricMethod(BaseMethod):
                 batch_features = [train_features[idx] for idx in batch_indices]
                 batch_labels = [train_labels[idx] for idx in batch_indices]
                 
-                # Pad sequences
+                # Pad sequences (features are already GPU tensors)
                 max_len = max(f.shape[0] for f in batch_features)
                 padded_features = []
                 masks = []
@@ -433,26 +460,43 @@ class CLSAttentionTopKMetricMethod(BaseMethod):
                 for features in batch_features:
                     seq_len = features.shape[0]
                     if seq_len < max_len:
-                        padding = np.zeros((max_len - seq_len, self.input_dim))
-                        padded = np.vstack([features, padding])
-                        mask = np.array([False] * seq_len + [True] * (max_len - seq_len))
+                        padding = torch.zeros(max_len - seq_len, self.input_dim, device=self.device)
+                        padded = torch.cat([features, padding], dim=0)
+                        mask = torch.tensor([False] * seq_len + [True] * (max_len - seq_len), dtype=torch.bool, device=self.device)
                     else:
                         padded = features
-                        mask = np.array([False] * seq_len)
+                        mask = torch.tensor([False] * seq_len, dtype=torch.bool, device=self.device)
                     
                     padded_features.append(padded)
                     masks.append(mask)
                 
-                # To tensors
-                X = torch.tensor(np.array(padded_features), dtype=torch.float32, device=self.device)
+                # Stack tensors (already on GPU)
+                X = torch.stack(padded_features)
                 y = torch.tensor(batch_labels, dtype=torch.float32, device=self.device)
-                mask = torch.tensor(np.array(masks), dtype=torch.bool, device=self.device)
+                mask = torch.stack(masks)
                 
                 # Forward
                 logits = self.transformer(X, mask=mask)
                 
-                # BCE loss
-                loss = F.binary_cross_entropy_with_logits(logits.squeeze(), y)
+                # Compute loss based on loss_type
+                if self.loss_type == 'bce':
+                    # Binary cross-entropy loss
+                    loss = F.binary_cross_entropy_with_logits(logits.squeeze(), y)
+                else:  # hinge
+                    # Hinge loss: separate positive and negative samples
+                    scores = logits.squeeze()
+                    pos_mask = y == 1
+                    neg_mask = y == 0
+                    
+                    if pos_mask.sum() > 0 and neg_mask.sum() > 0:
+                        pos_scores = scores[pos_mask].unsqueeze(1)  # (n_pos, 1)
+                        neg_scores = scores[neg_mask].unsqueeze(0)  # (1, n_neg)
+                        # Pairwise hinge loss
+                        losses = F.relu(self.margin - (pos_scores - neg_scores))
+                        loss = losses.mean()
+                    else:
+                        # Skip batch if all positive or all negative
+                        continue
                 
                 # Backward
                 optimizer.zero_grad()
@@ -526,7 +570,7 @@ class CLSAttentionTopKMetricMethod(BaseMethod):
                 batch_features = features[i:i + self.batch_size]
                 batch_labels = labels[i:i + self.batch_size]
                 
-                # Pad sequences
+                # Pad sequences (features are already GPU tensors)
                 max_len = max(f.shape[0] for f in batch_features)
                 padded_features = []
                 masks = []
@@ -534,19 +578,19 @@ class CLSAttentionTopKMetricMethod(BaseMethod):
                 for f in batch_features:
                     seq_len = f.shape[0]
                     if seq_len < max_len:
-                        padding = np.zeros((max_len - seq_len, self.input_dim))
-                        padded = np.vstack([f, padding])
-                        mask = np.array([False] * seq_len + [True] * (max_len - seq_len))
+                        padding = torch.zeros(max_len - seq_len, self.input_dim, device=self.device)
+                        padded = torch.cat([f, padding], dim=0)
+                        mask = torch.tensor([False] * seq_len + [True] * (max_len - seq_len), dtype=torch.bool, device=self.device)
                     else:
                         padded = f
-                        mask = np.array([False] * seq_len)
+                        mask = torch.tensor([False] * seq_len, dtype=torch.bool, device=self.device)
                     
                     padded_features.append(padded)
                     masks.append(mask)
                 
-                X = torch.tensor(np.array(padded_features), dtype=torch.float32, device=self.device)
+                X = torch.stack(padded_features)
                 y = torch.tensor(batch_labels, dtype=torch.float32, device=self.device)
-                mask = torch.tensor(np.array(masks), dtype=torch.bool, device=self.device)
+                mask = torch.stack(masks)
                 
                 logits = self.transformer(X, mask=mask)
                 predictions = (torch.sigmoid(logits.squeeze()) > 0.5).float()
@@ -558,28 +602,25 @@ class CLSAttentionTopKMetricMethod(BaseMethod):
     
     def _extract_topk_features(
         self,
-        features: np.ndarray,
-        attention: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray]:
+        features: torch.Tensor,
+        attention: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Extract top-k features based on attention weights.
         
         Args:
-            features: Logprobs (seq_len, num_logprobs)
-            attention: Attention weights (seq_len,)
+            features: Logprobs (seq_len, num_logprobs) - GPU tensor
+            attention: Attention weights (seq_len,) - GPU tensor
             
         Returns:
-            topk_attention: Top-k attention weights (k,)
-            topk_logprobs: Logprobs for top-k tokens (k, num_logprobs)
+            topk_attention: Top-k attention weights (k,) - GPU tensor
+            topk_logprobs: Logprobs for top-k tokens (k, num_logprobs) - GPU tensor
         """
-        # Get top-k indices
-        if len(attention) < self.top_k:
-            # If sequence shorter than k, pad
-            k = len(attention)
-            topk_indices = np.arange(k)
-        else:
-            topk_indices = np.argsort(attention)[-self.top_k:][::-1]
-            k = self.top_k
+        seq_len = attention.shape[0]
+    
+        # Get top-k indices based on attention weights
+        k = min(seq_len, self.top_k)
+        _, topk_indices = torch.topk(attention, k)
         
         # Extract top-k features
         topk_attention = attention[topk_indices]
@@ -588,19 +629,19 @@ class CLSAttentionTopKMetricMethod(BaseMethod):
         # Pad if necessary
         if k < self.top_k:
             # Pad with zeros
-            attn_padding = np.zeros(self.top_k - k)
-            logprob_padding = np.zeros((self.top_k - k, features.shape[1]))
+            attn_padding = torch.zeros(self.top_k - k, device=self.device)
+            logprob_padding = torch.zeros(self.top_k - k, features.shape[1], device=self.device)
             
-            topk_attention = np.concatenate([topk_attention, attn_padding])
-            topk_logprobs = np.vstack([topk_logprobs, logprob_padding])
+            topk_attention = torch.cat([topk_attention, attn_padding])
+            topk_logprobs = torch.cat([topk_logprobs, logprob_padding], dim=0)
         
         return topk_attention, topk_logprobs
     
     def _train_stage2(
         self,
-        train_features: List[np.ndarray],
+        train_data: List[Dict],
         train_labels: List[int],
-        val_features: Optional[List[np.ndarray]] = None,
+        val_data: Optional[List[Dict]] = None,
         val_labels: Optional[List[int]] = None
     ) -> Dict[str, Any]:
         """
@@ -633,13 +674,21 @@ class CLSAttentionTopKMetricMethod(BaseMethod):
         train_topk_attention = []
         train_topk_logprobs = []
         
-        for features in train_features:
-            # Get attention weights
-            X = torch.tensor(features, dtype=torch.float32, device=self.device).unsqueeze(0)
-            attention = self.attention_extractor.extract_attention(X).cpu().numpy()[0]
+        for item in train_data:
+            # Use pre-loaded tensor if available, otherwise create on-the-fly
+            if 'logprobs_tensor' in item:
+                features_tensor = item['logprobs_tensor']
+                X = features_tensor.unsqueeze(0)
+            else:
+                features = self._extract_features(item)
+                features_tensor = torch.tensor(features, dtype=torch.float32, device=self.device)
+                X = features_tensor.unsqueeze(0)
             
-            # Extract top-k
-            topk_attn, topk_lp = self._extract_topk_features(features, attention)
+            # Get attention weights (keep on GPU)
+            attention = self.attention_extractor.extract_attention(X).squeeze(0)
+            
+            # Extract top-k (all on GPU)
+            topk_attn, topk_lp = self._extract_topk_features(features_tensor, attention)
             train_topk_attention.append(topk_attn)
             train_topk_logprobs.append(topk_lp)
         
@@ -671,21 +720,33 @@ class CLSAttentionTopKMetricMethod(BaseMethod):
             for i in range(0, len(indices), self.batch_size):
                 batch_indices = indices[i:i + self.batch_size]
                 
-                # Prepare batch
-                batch_attention = np.array([train_topk_attention[idx] for idx in batch_indices])
-                batch_logprobs = np.array([train_topk_logprobs[idx] for idx in batch_indices])
-                batch_labels = np.array([train_labels[idx] for idx in batch_indices])
-                
-                # To tensors
-                attn = torch.tensor(batch_attention, dtype=torch.float32, device=self.device)
-                lp = torch.tensor(batch_logprobs, dtype=torch.float32, device=self.device)
-                y = torch.tensor(batch_labels, dtype=torch.float32, device=self.device)
+                # Stack tensors (already on GPU)
+                attn = torch.stack([train_topk_attention[idx] for idx in batch_indices])
+                lp = torch.stack([train_topk_logprobs[idx] for idx in batch_indices])
+                y = torch.tensor([train_labels[idx] for idx in batch_indices], dtype=torch.float32, device=self.device)
                 
                 # Forward
                 logits = self.metric_learner(attn, lp)
                 
-                # BCE loss
-                loss = F.binary_cross_entropy_with_logits(logits.squeeze(), y)
+                # Compute loss based on loss_type
+                if self.loss_type == 'bce':
+                    # Binary cross-entropy loss
+                    loss = F.binary_cross_entropy_with_logits(logits.squeeze(), y)
+                else:  # hinge
+                    # Hinge loss: separate positive and negative samples
+                    scores = logits.squeeze()
+                    pos_mask = y == 1
+                    neg_mask = y == 0
+                    
+                    if pos_mask.sum() > 0 and neg_mask.sum() > 0:
+                        pos_scores = scores[pos_mask].unsqueeze(1)  # (n_pos, 1)
+                        neg_scores = scores[neg_mask].unsqueeze(0)  # (1, n_neg)
+                        # Pairwise hinge loss
+                        losses = F.relu(self.margin - (pos_scores - neg_scores))
+                        loss = losses.mean()
+                    else:
+                        # Skip batch if all positive or all negative
+                        continue
                 
                 # Backward
                 optimizer.zero_grad()
@@ -699,8 +760,8 @@ class CLSAttentionTopKMetricMethod(BaseMethod):
             
             # Validation
             val_acc = None
-            if val_features is not None and val_labels is not None:
-                val_acc = self._evaluate_stage2(val_features, val_labels)
+            if val_data is not None and val_labels is not None:
+                val_acc = self._evaluate_stage2(val_data, val_labels)
                 val_accuracies.append(val_acc)
                 
                 print(f"Epoch {epoch+1}/{self.stage2_epochs} - Loss: {avg_loss:.4f} - Val Acc: {val_acc:.2%}")
@@ -747,7 +808,7 @@ class CLSAttentionTopKMetricMethod(BaseMethod):
             'best_val_acc': best_val_acc
         }
     
-    def _evaluate_stage2(self, features: List[np.ndarray], labels: List[int]) -> float:
+    def _evaluate_stage2(self, val_data: List[Dict], labels: List[int]) -> float:
         """Evaluate metric learner accuracy."""
         self.metric_learner.eval()
         
@@ -755,20 +816,27 @@ class CLSAttentionTopKMetricMethod(BaseMethod):
         total = 0
         
         with torch.no_grad():
-            for i in range(len(features)):
-                f = features[i]
+            for i in range(len(val_data)):
+                # Use pre-loaded tensor if available, otherwise create on-the-fly
+                if 'logprobs_tensor' in val_data[i]:
+                    features_tensor = val_data[i]['logprobs_tensor']
+                    X = features_tensor.unsqueeze(0)
+                else:
+                    f = self._extract_features(val_data[i])
+                    features_tensor = torch.tensor(f, dtype=torch.float32, device=self.device)
+                    X = features_tensor.unsqueeze(0)
+                
                 label = labels[i]
                 
-                # Get attention
-                X = torch.tensor(f, dtype=torch.float32, device=self.device).unsqueeze(0)
-                attention = self.attention_extractor.extract_attention(X).cpu().numpy()[0]
+                # Get attention (keep on GPU)
+                attention = self.attention_extractor.extract_attention(X).squeeze(0)
                 
-                # Extract top-k
-                topk_attn, topk_lp = self._extract_topk_features(f, attention)
+                # Extract top-k (all on GPU)
+                topk_attn, topk_lp = self._extract_topk_features(features_tensor, attention)
                 
-                # To tensors
-                attn = torch.tensor(topk_attn, dtype=torch.float32, device=self.device).unsqueeze(0)
-                lp = torch.tensor(topk_lp, dtype=torch.float32, device=self.device).unsqueeze(0)
+                # Add batch dimension
+                attn = topk_attn.unsqueeze(0)
+                lp = topk_lp.unsqueeze(0)
                 y = label
                 
                 # Forward
@@ -798,30 +866,31 @@ class CLSAttentionTopKMetricMethod(BaseMethod):
         print(f"{'='*80}")
         sys.stdout.flush()
         
-        # Extract features
-        print("\nExtracting features...")
+        # Pre-load data to GPU
+        print("\nPre-loading data to GPU...")
+        train_data = self._preload_data_to_gpu(train_data)
+        if val_data is not None:
+            val_data = self._preload_data_to_gpu(val_data)
+        
+        # Extract features for Stage 1
+        print("\nPreparing features for Stage 1...")
         train_features = []
         train_labels = []
         
-        for rollout in train_data:
-            features = self._extract_features(rollout)
-            if features.size == 0:
-                continue
-            
-            train_features.append(features)
-            train_labels.append(1 if rollout['is_correct'] else 0)
+        for item in train_data:
+            if 'logprobs_tensor' in item:
+                train_features.append(item['logprobs_tensor'])
+                train_labels.append(1 if item['is_correct'] else 0)
         
         val_features = None
         val_labels = None
         if val_data is not None:
             val_features = []
             val_labels = []
-            for rollout in val_data:
-                features = self._extract_features(rollout)
-                if features.size == 0:
-                    continue
-                val_features.append(features)
-                val_labels.append(1 if rollout['is_correct'] else 0)
+            for item in val_data:
+                if 'logprobs_tensor' in item:
+                    val_features.append(item['logprobs_tensor'])
+                    val_labels.append(1 if item['is_correct'] else 0)
         
         # Determine input dimension
         self.input_dim = train_features[0].shape[1]
@@ -835,10 +904,10 @@ class CLSAttentionTopKMetricMethod(BaseMethod):
             val_features, val_labels
         )
         
-        # Stage 2: Train metric learner
+        # Stage 2: Train metric learner (pass full data items for pre-loaded tensors)
         stage2_metrics = self._train_stage2(
-            train_features, train_labels,
-            val_features, val_labels
+            train_data, train_labels,
+            val_data, val_labels
         )
         
         self.is_trained = True
@@ -856,22 +925,28 @@ class CLSAttentionTopKMetricMethod(BaseMethod):
         if self.metric_learner is None or self.attention_extractor is None:
             raise ValueError("Model not trained. Call train() first.")
         
-        # Extract features
-        features = self._extract_features(rollout)
+        # Use pre-loaded tensor if available, otherwise create on-the-fly
+        if 'logprobs_tensor' in rollout:
+            features_tensor = rollout['logprobs_tensor']
+            X = features_tensor.unsqueeze(0)
+        else:
+            features = self._extract_features(rollout)
+            
+            if features.size == 0:
+                return 0.0
+            
+            features_tensor = torch.tensor(features, dtype=torch.float32, device=self.device)
+            X = features_tensor.unsqueeze(0)
         
-        if features.size == 0:
-            return 0.0
+        # Get attention (keep on GPU)
+        attention = self.attention_extractor.extract_attention(X).squeeze(0)
         
-        # Get attention
-        X = torch.tensor(features, dtype=torch.float32, device=self.device).unsqueeze(0)
-        attention = self.attention_extractor.extract_attention(X).cpu().numpy()[0]
+        # Extract top-k (all on GPU)
+        topk_attn, topk_lp = self._extract_topk_features(features_tensor, attention)
         
-        # Extract top-k
-        topk_attn, topk_lp = self._extract_topk_features(features, attention)
-        
-        # To tensors
-        attn = torch.tensor(topk_attn, dtype=torch.float32, device=self.device).unsqueeze(0)
-        lp = torch.tensor(topk_lp, dtype=torch.float32, device=self.device).unsqueeze(0)
+        # Add batch dimension
+        attn = topk_attn.unsqueeze(0)
+        lp = topk_lp.unsqueeze(0)
         
         # Predict
         self.metric_learner.eval()

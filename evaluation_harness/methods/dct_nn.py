@@ -78,6 +78,25 @@ class DCTNNMethod(BaseMethod):
         self.model = None
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
+    def _preload_data_to_gpu(self, data: List[Dict]) -> List[Dict]:
+        """Pre-load all DCT features to GPU as tensors to avoid repeated CPU-GPU transfers."""
+        print(f"Pre-loading {len(data)} items to GPU...")
+        sys.stdout.flush()
+        
+        preloaded_data = []
+        for item in data:
+            # dct_features are already numpy arrays, convert to GPU tensors
+            tensor = torch.tensor(item['dct_features'], dtype=torch.float32, device=self.device)
+            
+            preloaded_item = item.copy()
+            preloaded_item['dct_features_tensor'] = tensor
+            preloaded_data.append(preloaded_item)
+        
+        print(f"✓ Pre-loaded data to GPU")
+        sys.stdout.flush()
+        
+        return preloaded_data
+    
     def extract_dct_coeffs(self, logprobs: np.ndarray) -> np.ndarray:
         """
         Extract DCT coefficients from logprob sequence.
@@ -177,6 +196,11 @@ class DCTNNMethod(BaseMethod):
         print(f"{'='*80}")
         sys.stdout.flush()
         
+        # Pre-load data to GPU
+        train_data = self._preload_data_to_gpu(train_data)
+        if val_data:
+            val_data = self._preload_data_to_gpu(val_data)
+        
         # Organize by problem
         train_problems = defaultdict(list)
         for item in train_data:
@@ -224,17 +248,17 @@ class DCTNNMethod(BaseMethod):
             for i, pid in enumerate(problem_ids):
                 rollouts = train_problems[pid]
                 
-                # Build batch
+                # Build batch from pre-loaded GPU tensors
                 features = []
                 truths = []
                 for r in rollouts:
-                    features.append(torch.tensor(r['dct_features'], dtype=torch.float32))
+                    features.append(r['dct_features_tensor'])  # Already on GPU
                     truths.append(1 if r['is_correct'] else 0)
                 
                 if not features:
                     continue
                 
-                batch = torch.stack(features).to(self.device)
+                batch = torch.stack(features)
                 scores = self.model(batch)
                 
                 truths = torch.tensor(truths, dtype=torch.bool, device=self.device)
@@ -367,13 +391,13 @@ class DCTNNMethod(BaseMethod):
                 features = []
                 truths = []
                 for r in rollouts:
-                    features.append(torch.tensor(r['dct_features'], dtype=torch.float32))
+                    features.append(r['dct_features_tensor'])  # Already on GPU
                     truths.append(r['is_correct'])
                 
                 if not features:
                     continue
                 
-                batch = torch.stack(features).to(self.device)
+                batch = torch.stack(features)
                 scores = self.model(batch)
                 best_idx = int(torch.argmax(scores).cpu().numpy())
                 if truths[best_idx]:
@@ -393,13 +417,13 @@ class DCTNNMethod(BaseMethod):
                 features = []
                 truths = []
                 for r in rollouts:
-                    features.append(torch.tensor(r['dct_features'], dtype=torch.float32))
+                    features.append(r['dct_features_tensor'])  # Already on GPU
                     truths.append(1 if r['is_correct'] else 0)
                 
                 if not features:
                     continue
                 
-                batch = torch.stack(features).to(self.device)
+                batch = torch.stack(features)
                 scores = self.model(batch)
                 truths_t = torch.tensor(truths, dtype=torch.bool, device=self.device)
                 pos_idx = torch.nonzero(truths_t).squeeze(-1)
@@ -460,7 +484,11 @@ class DCTNNMethod(BaseMethod):
         
         self.model.eval()
         
-        features = torch.tensor(data_item['dct_features'], dtype=torch.float32).unsqueeze(0).to(self.device)
+        # Check if already pre-loaded as tensor
+        if 'dct_features_tensor' in data_item:
+            features = data_item['dct_features_tensor'].unsqueeze(0)
+        else:
+            features = torch.tensor(data_item['dct_features'], dtype=torch.float32, device=self.device).unsqueeze(0)
         
         with torch.no_grad():
             score = self.model(features).cpu().item()

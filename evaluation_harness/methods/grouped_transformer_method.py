@@ -223,6 +223,26 @@ class GroupedTransformerMethod(BaseMethod):
         self.num_top_logprobs = None
         self.model = None
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    def _preload_data_to_gpu(self, data: List[Dict]) -> List[Dict]:
+        """Pre-load all logprobs to GPU as tensors to avoid repeated CPU-GPU transfers."""
+        print(f"Pre-loading {len(data)} items to GPU...")
+        sys.stdout.flush()
+        
+        preloaded_data = []
+        for item in data:
+            # Convert to GPU tensor immediately
+            tensor = torch.tensor(item['logprobs'], dtype=torch.float32, device=self.device)
+            
+            preloaded_item = item.copy()
+            preloaded_item['logprobs_tensor'] = tensor
+            preloaded_item['seq_len'] = tensor.shape[0]
+            preloaded_data.append(preloaded_item)
+        
+        print(f"✓ Pre-loaded data to GPU")
+        sys.stdout.flush()
+        
+        return preloaded_data
 
     def _prepare_grouped_data(self, data: List[Dict]) -> List[Dict]:
         """Apply windowed grouping to all data items."""
@@ -273,6 +293,11 @@ class GroupedTransformerMethod(BaseMethod):
         if val_data:
             print("Applying windowed grouping to validation data...")
             val_data = self._prepare_grouped_data(val_data)
+        
+        # Pre-load data to GPU
+        train_data = self._preload_data_to_gpu(train_data)
+        if val_data:
+            val_data = self._preload_data_to_gpu(val_data)
 
         # Organize by problem
         train_problems = defaultdict(list)
@@ -338,12 +363,11 @@ class GroupedTransformerMethod(BaseMethod):
             for i, pid in enumerate(problem_ids):
                 rollouts = train_problems[pid]
 
-                # Build batch
+                # Build batch from pre-loaded GPU tensors
                 tensors = []
                 truths = []
                 for r in rollouts:
-                    lp = r['logprobs']  # Already grouped
-                    tensors.append(torch.tensor(lp, dtype=torch.float32))
+                    tensors.append(r['logprobs_tensor'])  # Already on GPU
                     truths.append(1 if r['is_correct'] else 0)
 
                 if not tensors:
@@ -352,17 +376,15 @@ class GroupedTransformerMethod(BaseMethod):
                 # Determine max_len for grouped sequences
                 max_len = max(t.shape[0] for t in tensors)
                 
-                batch = torch.zeros((len(tensors), max_len, tensors[0].shape[1]), dtype=torch.float32)
-                mask = torch.ones((len(tensors), max_len), dtype=torch.bool)  # True = padding
+                # Create batch and mask directly on GPU
+                batch = torch.zeros((len(tensors), max_len, tensors[0].shape[1]), dtype=torch.float32, device=self.device)
+                mask = torch.ones((len(tensors), max_len), dtype=torch.bool, device=self.device)
                 
                 for bi, t in enumerate(tensors):
                     # Pad to max_len
                     seq_len = t.shape[0]
                     batch[bi, :seq_len, :] = t
                     mask[bi, :seq_len] = False  # False = real token
-
-                batch = batch.to(self.device)
-                mask = mask.to(self.device)
                 scores = self.model(batch, mask=mask)
 
                 truths = torch.tensor(truths, dtype=torch.bool, device=self.device)
@@ -508,8 +530,7 @@ class GroupedTransformerMethod(BaseMethod):
                 tensors = []
                 truths = []
                 for r in rollouts:
-                    lp = r['logprobs']  # Already grouped
-                    tensors.append(torch.tensor(lp, dtype=torch.float32))
+                    tensors.append(r['logprobs_tensor'])  # Already on GPU
                     truths.append(r['is_correct'])
 
                 if not tensors:
@@ -517,16 +538,15 @@ class GroupedTransformerMethod(BaseMethod):
 
                 max_len = max(t.shape[0] for t in tensors)
                 
-                batch = torch.zeros((len(tensors), max_len, tensors[0].shape[1]), dtype=torch.float32)
-                mask = torch.ones((len(tensors), max_len), dtype=torch.bool)
+                # Create batch and mask directly on GPU
+                batch = torch.zeros((len(tensors), max_len, tensors[0].shape[1]), dtype=torch.float32, device=self.device)
+                mask = torch.ones((len(tensors), max_len), dtype=torch.bool, device=self.device)
                 
                 for i, t in enumerate(tensors):
                     seq_len = t.shape[0]
                     batch[i, :seq_len, :] = t
                     mask[i, :seq_len] = False
 
-                batch = batch.to(self.device)
-                mask = mask.to(self.device)
                 scores = self.model(batch, mask=mask)
                 best_idx = int(torch.argmax(scores).cpu().numpy())
                 if truths[best_idx]:
@@ -546,8 +566,7 @@ class GroupedTransformerMethod(BaseMethod):
                 tensors = []
                 truths = []
                 for r in rollouts:
-                    lp = r['logprobs']  # Already grouped
-                    tensors.append(torch.tensor(lp, dtype=torch.float32))
+                    tensors.append(r['logprobs_tensor'])  # Already on GPU
                     truths.append(1 if r['is_correct'] else 0)
 
                 if not tensors:
@@ -555,16 +574,15 @@ class GroupedTransformerMethod(BaseMethod):
 
                 max_len = max(t.shape[0] for t in tensors)
                 
-                batch = torch.zeros((len(tensors), max_len, tensors[0].shape[1]), dtype=torch.float32)
-                mask = torch.ones((len(tensors), max_len), dtype=torch.bool)
+                # Create batch and mask directly on GPU
+                batch = torch.zeros((len(tensors), max_len, tensors[0].shape[1]), dtype=torch.float32, device=self.device)
+                mask = torch.ones((len(tensors), max_len), dtype=torch.bool, device=self.device)
                 
                 for i, t in enumerate(tensors):
                     seq_len = t.shape[0]
                     batch[i, :seq_len, :] = t
                     mask[i, :seq_len] = False
 
-                batch = batch.to(self.device)
-                mask = mask.to(self.device)
                 scores = self.model(batch, mask=mask)
                 truths_t = torch.tensor(truths, dtype=torch.bool, device=self.device)
                 pos_idx = torch.nonzero(truths_t).squeeze(-1)
@@ -625,25 +643,26 @@ class GroupedTransformerMethod(BaseMethod):
 
         self.model.eval()
 
-        lp = data_item['logprobs']
-        
-        # Apply tail tokens if specified
-        if self.tail_tokens is not None and self.tail_tokens > 0:
-            lp = lp[-self.tail_tokens:]
-        
-        # Apply windowed grouping
-        grouped_lp = apply_windowed_grouping(lp, self.window_size)
+        # Check if already pre-loaded as tensor
+        if 'logprobs_tensor' in data_item:
+            tensor = data_item['logprobs_tensor']
+        else:
+            lp = data_item['logprobs']
+            
+            # Apply tail tokens if specified
+            if self.tail_tokens is not None and self.tail_tokens > 0:
+                lp = lp[-self.tail_tokens:]
+            
+            # Apply windowed grouping
+            grouped_lp = apply_windowed_grouping(lp, self.window_size)
+            tensor = torch.tensor(grouped_lp, dtype=torch.float32, device=self.device)
 
-        # Create padded batch with mask
-        tensor = torch.tensor(grouped_lp, dtype=torch.float32)
+        # Create padded batch with mask directly on GPU
         max_len = tensor.shape[0]
-        batch = torch.zeros((1, max_len, tensor.shape[1]), dtype=torch.float32)
-        mask = torch.zeros((1, max_len), dtype=torch.bool)  # No padding needed for single item
+        batch = torch.zeros((1, max_len, tensor.shape[1]), dtype=torch.float32, device=self.device)
+        mask = torch.zeros((1, max_len), dtype=torch.bool, device=self.device)  # No padding needed for single item
         
         batch[0, :, :] = tensor
-        
-        batch = batch.to(self.device)
-        mask = mask.to(self.device)
 
         with torch.no_grad():
             score = self.model(batch, mask=mask).cpu().item()
