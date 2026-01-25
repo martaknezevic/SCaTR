@@ -1,0 +1,1 @@
+python evaluate_responses.py --responses /efs/cactts/data/qwen1_7b/bigcodebench_hard/turn1/all_response_metrics_regenerated.jsonl --dataset /home/ubuntu/cactts/datasets/bigcodebench_hard.jsonl --output /efs/cactts/data/qwen1_7b/bigcodebench_hard/turn1/all_response_metrics_regraded.jsonl
