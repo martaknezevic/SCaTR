@@ -356,7 +356,7 @@ class GSM8KLoader(DatasetLoader):
         if HF_AVAILABLE:
             try:
                 print(f"Loading GSM8K dataset from HuggingFace: {dataset_source}")
-                dataset = load_dataset(dataset_source, split=split)
+                dataset = load_dataset(dataset_source, 'main', split=split).shuffle(seed=42).select(range(1000))
                 
                 problems = []
                 for i, item in enumerate(dataset):
@@ -568,6 +568,21 @@ class GenericExtractor(AnswerExtractor):
         if matches:
             return matches[-1].strip()
         
+        # Try "The final answer is $...$" or "The final answer is ..." patterns
+        final_answer_patterns = [
+            r'(?:the\s+)?final\s+answer\s+is\s+\$([^$]+)\$',  # "final answer is $110$"
+            r'(?:the\s+)?final\s+answer\s+is\s+[:\=]?\s*(.+?)(?:\.|$)',  # "final answer is 110" or "final answer is: 110"
+        ]
+        
+        for pattern in final_answer_patterns:
+            matches = re.findall(pattern, response_text, re.IGNORECASE)
+            if matches:
+                answer = matches[-1].strip()
+                # Clean up common LaTeX/formatting artifacts
+                answer = answer.replace('\\', '').replace('$', '').strip()
+                if answer:
+                    return answer
+        
         # Try general answer patterns
         answer_patterns = [
             r'(?:answer|result|solution)(?:\s+is)?\s*[:\=]?\s*(.+?)(?:\.|$)',
@@ -774,6 +789,7 @@ class EvaluationConfig:
             'max_concurrent': ('performance', 'max_concurrent'),
             'batch_size': ('performance', 'batch_size'),
             'output_dir': ('output', 'output_dir'),
+            'base_url': ('openai', 'base_url'),
         }
         
         for arg_name, (section, key) in arg_mappings.items():
@@ -1332,6 +1348,7 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, help="Batch size")
     parser.add_argument("--output_dir", type=str, help="Output directory")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--base_url", type=str, help="OpenAI API base URL")
     
     return parser.parse_args()
 

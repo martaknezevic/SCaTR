@@ -356,25 +356,41 @@ class MarkdownCodeBlockExtractor(CodeExtractor):
         return "MarkdownCodeBlock"
     
     def extract(self, response_text: str, entry_point: Optional[str] = None) -> Optional[str]:
-        """Extract code from ```python``` blocks"""
+        """Extract code from ```python``` blocks, trying from last to first"""
         if not response_text:
             return None
         
         # Look for ```python or ``` code blocks
-        pattern = r'```(?:python)?\n(.*?)```'
+        pattern = r'```(?:python)?\s*\n(.*?)```'
         matches = re.findall(pattern, response_text, re.DOTALL)
         
-        if matches:
-            code = matches[-1].strip()  # Take last code block
+        if not matches:
+            return None
+        
+        # Try code blocks from last to first
+        for code in reversed(matches):
+            code = code.strip()
+            if not code:
+                continue
             
-            # If entry point specified, extract that function
-            if entry_point and code:
+            # If entry point specified, try to extract that function
+            if entry_point:
                 try:
-                    code = extract_function_with_dependencies(code, entry_point)
+                    extracted = extract_function_with_dependencies(code, entry_point)
+                    if extracted:
+                        return extracted
                 except Exception:
-                    pass
-            
-            return code
+                    # If extraction fails, try next code block
+                    continue
+            else:
+                # No entry point, return the code as-is
+                return code
+        
+        # If we have matches but couldn't extract with entry_point, return last non-empty block
+        for code in reversed(matches):
+            code = code.strip()
+            if code:
+                return code
         
         return None
 
@@ -463,6 +479,70 @@ class ExecutorAPIGrader(CodeGrader):
                 )
 
 
+class HybridExtractor(CodeExtractor):
+    """Hybrid extractor that tries both <output> tags and markdown, picks best result"""
+    
+    def __init__(self, grader: ExecutorAPIGrader, execution_timeout: int = 10):
+        self.output_extractor = OutputTagExtractor()
+        self.markdown_extractor = MarkdownCodeBlockExtractor()
+        self.grader = grader
+        self.execution_timeout = execution_timeout
+    
+    def get_name(self) -> str:
+        return "Hybrid"
+    
+    async def extract_and_grade(self, response_text: str, entry_point: Optional[str], 
+                                test_cases, extractor) -> tuple:
+        """Extract code and grade it"""
+        code = extractor.extract(response_text, entry_point)
+        if not code:
+            return None, 0, []
+        
+        is_passing, feedback, partial_tests = await self.grader.grade(
+            code, test_cases, self.execution_timeout
+        )
+        
+        num_passed = int(np.sum(np.asarray(partial_tests, dtype=np.float32)))
+        
+        return code, num_passed, partial_tests
+    
+    async def extract_with_test(self, response_text: str, entry_point: Optional[str] = None,
+                               test_cases = None) -> Optional[str]:
+        """Extract using both methods and pick the one that passes more tests"""
+        if not response_text or test_cases is None:
+            # Fallback to output tag if no test cases provided
+            return self.output_extractor.extract(response_text, entry_point)
+        
+        # Try both extractors
+        output_code, output_passed, _ = await self.extract_and_grade(
+            response_text, entry_point, test_cases, self.output_extractor
+        )
+        
+        markdown_code, markdown_passed, _ = await self.extract_and_grade(
+            response_text, entry_point, test_cases, self.markdown_extractor
+        )
+        
+        # Pick the one with more tests passed
+        if output_code is None and markdown_code is None:
+            return None
+        elif output_code is None:
+            return markdown_code
+        elif markdown_code is None:
+            return output_code
+        elif markdown_passed > output_passed:
+            return markdown_code
+        else:
+            return output_code
+    
+    def extract(self, response_text: str, entry_point: Optional[str] = None) -> Optional[str]:
+        """Synchronous extract - just try markdown first, then output tags"""
+        # This is for non-async usage
+        code = self.markdown_extractor.extract(response_text, entry_point)
+        if code:
+            return code
+        return self.output_extractor.extract(response_text, entry_point)
+
+
 # ============================================================================
 # Factory Classes
 # ============================================================================
@@ -495,14 +575,15 @@ class ExtractorFactory:
         'output_tag': OutputTagExtractor,
         'markdown': MarkdownCodeBlockExtractor,
         'generic': GenericCodeExtractor,
+        'hybrid': HybridExtractor,
     }
     
     @classmethod
-    def create(cls, extractor_type: str) -> CodeExtractor:
+    def create(cls, extractor_type: str, **kwargs) -> CodeExtractor:
         extractor_type = extractor_type.lower()
         if extractor_type not in cls._extractors:
             raise ValueError(f"Unknown extractor type: {extractor_type}")
-        return cls._extractors[extractor_type]()
+        return cls._extractors[extractor_type](**kwargs)
     
     @classmethod
     def register(cls, name: str, extractor_class: type):
@@ -557,7 +638,6 @@ class CodeEvaluationConfig:
         self.top_logprobs = gen_config.get('top_logprobs', 10)
         self.system_prompt = gen_config['system_prompt']
         self.streaming = gen_config.get('streaming', False)
-        self.max_completion_length = gen_config.get('max_completion_length', 2048)
         
         # Evaluation parameters
         eval_config = config_dict['evaluation']
@@ -605,6 +685,7 @@ class CodeEvaluationConfig:
             'batch_size': ('performance', 'batch_size'),
             'output_dir': ('output', 'output_dir'),
             'num_samples': ('dataset', 'num_samples'),
+            'base_url': ('openai', 'base_url'),
         }
         
         for arg_name, (section, key) in arg_mappings.items():
@@ -630,8 +711,17 @@ class CodeEvaluator:
         
         # Initialize components
         self.loader = LoaderFactory.create(config.loader_type)
-        self.extractor = ExtractorFactory.create(config.extractor_type)
         self.grader = GraderFactory.create(config.grader_type, **config.grader_params)
+        
+        # Initialize extractor (hybrid extractor needs grader)
+        if config.extractor_type.lower() == 'hybrid':
+            self.extractor = ExtractorFactory.create(
+                config.extractor_type,
+                grader=self.grader,
+                execution_timeout=config.execution_timeout
+            )
+        else:
+            self.extractor = ExtractorFactory.create(config.extractor_type)
         
         # Initialize metrics calculator
         self.metrics_calculator = ConfidenceMetrics()
@@ -663,18 +753,21 @@ class CodeEvaluator:
     
     def _format_prompt(self, problem: CodeProblem) -> str:
         """Format problem text into a complete prompt"""
-        additional_prompt = (
-            f"\nNote that if you don't complete thinking and the code generation "
-            f"within {self.config.max_completion_length} tokens, you will get a zero reward."
-        )
+        #additional_prompt = (
+        #    f"\nNote that if you don't complete thinking and the code generation "
+        #    f"within {self.config.max_completion_length} tokens, you will get a zero reward."
+        #)
         
-        return problem.problem_text + additional_prompt
+        return problem.problem_text #+ additional_prompt
     
     def _extract_message(self, choice):
         """Extract full text message from a vLLM/OpenAI-style choice object."""
-        if not hasattr(choice, "logprobs") or not hasattr(choice.logprobs, "content"):
-            return choice.message.content if hasattr(choice, "message") else ""
-        return "".join(cct.token for cct in choice.logprobs.content if hasattr(cct, "token"))
+        if hasattr(choice, "message") and hasattr(choice.message, "content"):
+            return choice.message.content if choice.message.content else ""
+        
+        # Fallback: if no message content, return empty string
+        return ""
+        
     
     async def generate_single_response_stream(self, config: Dict[str, Any]) -> Choice:
         """Generate a single response with streaming"""
@@ -885,7 +978,7 @@ class CodeEvaluator:
                 {"role": "system", "content": self.config.system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            "max_tokens": self.config.max_completion_length,
+            # "max_tokens": self.config.max_completion_length,
             "logprobs": True,
             "top_logprobs": self.config.top_logprobs,
             "extra_body": {"reasoning_effort": "high"}
@@ -1056,6 +1149,7 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, help="Output directory")
     parser.add_argument("--num_samples", type=int, help="Number of samples to evaluate")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--base_url", type=str, help="OpenAI API base URL")
     
     return parser.parse_args()
 
