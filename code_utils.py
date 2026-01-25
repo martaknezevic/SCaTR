@@ -76,12 +76,28 @@ def seed_everything(seed: int = 42):
     print(f"Seeding done with seed = {seed}")
 
 
-def parse_between_output_tags(text):
+def parse_between_output_tags_old(text):
     match = re.search(r"<output>(.*?)</output>", text, re.DOTALL)
     if match:
         return match.group(1).strip()
     else:
         return text
+
+def parse_between_output_tags_old_v2(text):
+    matches = re.findall(r"<output>(.*?)</output>", text, re.DOTALL)
+    if matches:
+        return matches[-1].strip()
+    return text
+
+def parse_between_output_tags(text):
+    pattern = r"<output>((?:(?!<output>).)*?)</output>"
+    matches = re.findall(pattern, text, re.DOTALL)
+
+    if matches:
+        return matches[-1].strip()
+
+    return text
+
 
 
 def load_yaml_config(path: str) -> dict:

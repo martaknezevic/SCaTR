@@ -72,11 +72,11 @@ def execute_code(req: ExecutionRequest):
         feedback = result.feedback
         code = req.code
         
-        print("="*100)
-        print(code)
-        print()
-        print(result.feedback)
-        print("="*100)
+        #print("="*100)
+        #print(code)
+        #print()
+        #print(result.feedback)
+        #print("="*100)
 
         # Fix 4: Convert boolean state to float partial scores (1.0 for pass, 0.0 for fail)
         partial = [1.0 if test_passed else 0.0 for test_passed in result.state]
@@ -87,9 +87,9 @@ def execute_code(req: ExecutionRequest):
             is_passing=is_passing, feedback=feedback, partial_test_cases=partial
         )
     except Exception as e:
-        print("=" * 100)
-        print("Execution Error:")
-        print(e)
-        print("=" * 100)
+        #print("=" * 100)
+        #print("Execution Error:")
+        #print(e)
+        #print("=" * 100)
         logger.exception("Execution error")
         raise HTTPException(status_code=500, detail=f"Execution error: {e}")

@@ -147,7 +147,11 @@ class MetricsStorage:
         use_compression: bool = True
     ):
         """Safely append a batch of metrics (multi-process safe)"""
-        os.makedirs(os.path.dirname(output_file), exist_ok=True)
+        # Create directory only if output_file has a directory component
+        output_dir = os.path.dirname(output_file)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        
         lock = FileLock(output_file + ".lock")
 
         with lock:  # ensures exclusive access
