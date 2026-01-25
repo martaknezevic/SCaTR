@@ -12,7 +12,7 @@ answer_handling:
   grader_params: {}               # Additional grader parameters
 
 generation:
-  n_gen: 32                       # Number of responses to generate per problem
+  n_gen: 16                       # Number of responses to generate per problem
   temperature: 0.6                # Sampling temperature (0.0 = greedy, higher = more random)
   top_logprobs: 10                # Number of top logprobs to return per token
   streaming: false                # Enable streaming generation
@@ -26,7 +26,7 @@ evaluation:
   group_size: 1024                # Group size for group-based metrics aggregation
 
 performance:
-  max_concurrent: 3               # Maximum number of problems to evaluate concurrently
+  max_concurrent: 10               # Maximum number of problems to evaluate concurrently
   batch_size: 10                  # Number of problems per batch
 
 output:

@@ -2,7 +2,7 @@
 # MATH problems require symbolic mathematical answers, often in LaTeX format
 
 dataset:
-  source: "datasets/math500_subset.jsonl"  # HuggingFace dataset or local JSON path
+  source: HuggingFaceH4/MATH-500 #"datasets/math500_subset.jsonl"  # HuggingFace dataset or local JSON path
   split: "test"                          # Dataset split: train, test
   loader_type: "math"                    # Loader type: aime, math, gsm8k, generic
 
@@ -12,7 +12,7 @@ answer_handling:
   grader_params: {}                      # Additional grader parameters
 
 generation:
-  n_gen: 32                              # Number of responses to generate per problem
+  n_gen: 16                             # Number of responses to generate per problem
   temperature: 0.6                       # Sampling temperature
   top_logprobs: 10                       # Number of top logprobs to return per token
   streaming: false                       # Enable streaming generation
@@ -27,8 +27,8 @@ evaluation:
   group_size: 1024                       # Group size for group-based metrics aggregation
 
 performance:
-  max_concurrent: 3                      # Maximum number of problems to evaluate concurrently
-  batch_size: 10                         # Number of problems per batch
+  max_concurrent: 20                      # Maximum number of problems to evaluate concurrently
+  batch_size: 20                       # Number of problems per batch
 
 output:
   output_dir: "./outputs/math"           # Base output directory

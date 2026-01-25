@@ -2,8 +2,8 @@
 # GSM8K problems require numeric answers with intermediate reasoning steps
 
 dataset:
-  source: "gsm8k"                        # HuggingFace dataset name
-  split: "test"                          # Dataset split: train, test
+  source: openai/gsm8k                        # HuggingFace dataset name
+  split: "train"                          # Dataset split: train, test
   loader_type: "gsm8k"                   # Loader type: aime, math, gsm8k, generic
 
 answer_handling:
@@ -12,7 +12,7 @@ answer_handling:
   grader_params: {}                      # Additional grader parameters
 
 generation:
-  n_gen: 32                              # Number of responses to generate per problem
+  n_gen: 16                              # Number of responses to generate per problem
   temperature: 0.6                       # Sampling temperature
   top_logprobs: 10                       # Number of top logprobs to return per token
   streaming: false                       # Enable streaming generation
@@ -27,8 +27,8 @@ evaluation:
   group_size: 1024                       # Group size for group-based metrics aggregation
 
 performance:
-  max_concurrent: 5                      # Maximum number of problems to evaluate concurrently
-  batch_size: 20                         # Number of problems per batch (GSM8K is larger)
+  max_concurrent: 20                      # Maximum number of problems to evaluate concurrently
+  batch_size: 30                         # Number of problems per batch (GSM8K is larger)
 
 output:
   output_dir: "./outputs/gsm8k"          # Base output directory

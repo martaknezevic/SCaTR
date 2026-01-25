@@ -1,24 +1,24 @@
 # Configuration for Kodcode Code Evaluation
 
 dataset:
-  source: "kodcode_light_rl.jsonl"  # HuggingFace dataset or local JSON/JSONL path
+  source: "datasets/kodcode_1000.jsonl"  # HuggingFace dataset or local JSON/JSONL path
   split: "test"
   loader_type: "kodcode"
   num_samples: null  # null = use all, or specify a number
 
 code_handling:
-  extractor_type: "output_tag"  # output_tag, markdown, generic
+  extractor_type: "markdown" #"hybrid" #"generic" #"output_tag"  # output_tag, markdown, generic
   grader_type: "executor_api"
   grader_params:
     executor_url: "http://localhost:8001/execute"
-    max_concurrent: 6
+    max_concurrent: 48  # Increased from 6
   execution_timeout: 10  # seconds per test case
 
 generation:
-  n_gen: 32                       # Number of responses to generate per problem
+  n_gen: 16                       # Number of responses to generate per problem
   temperature: 0.6                # Sampling temperature (0.0 = greedy, higher = more random)
   top_logprobs: 10                # Number of top logprobs to return per token
-  streaming: false                # Enable streaming generation
+  streaming: true                # Enable streaming generation
   system_prompt: |
     You are a Python coding AI agent. When given a Python function signature and docstring, you must provide a complete Python solution following this exact format:
 
@@ -43,8 +43,8 @@ evaluation:
   group_size: 1024                # Group size for group-based metrics aggregation
 
 performance:
-  max_concurrent: 3  # max concurrent problems (adjust based on resources)
-  batch_size: 10  # problems per batch
+  max_concurrent: 25  # max concurrent problems (adjust based on resources)
+  batch_size: 25  # problems per batch
 
 output:
   output_dir: "./results/kodcode"
@@ -53,7 +53,7 @@ output:
   strategies_file: "strategy_results.json"
 
 openai:
-  model_id: null  # null = auto-detect from server
+  model_id: Qwen/Qwen3-1.7B  # null = auto-detect from server
   base_url: "http://localhost:8000/v1"
   api_key: "token-abc"
   timeout: 3600

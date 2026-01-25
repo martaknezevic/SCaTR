@@ -1,18 +1,18 @@
-# Configuration for HumanEval Code Evaluation
+# Configuration for BigCodeBench Dataset Evaluation
 
 dataset:
-  source: "datasets/humaneval.jsonl"  # HuggingFace dataset or local JSON path
+  source: "/home/ubuntu/cactts/datasets/bigcodebench_hard.jsonl"  # Path to BigCodeBench JSONL file
   split: "test"
-  loader_type: "humaneval"
-  num_samples: null  # null = use all, or specify a number
+  loader_type: "bigcodebench"
+  num_samples: null  # Set to limit number of samples, or null for all
 
 code_handling:
-  extractor_type: "hybrid" #"generic" #"output_tag"  # output_tag, markdown, generic
+  extractor_type: "hybrid"  # Options: output_tag, markdown, generic, hybrid
   grader_type: "executor_api"
   grader_params:
     executor_url: "http://localhost:8001/execute"
     max_concurrent: 6
-  execution_timeout: 10  # seconds per test case
+  execution_timeout: 10
 
 generation:
   n_gen: 16                       # Number of responses to generate per problem
@@ -47,7 +47,7 @@ performance:
   batch_size: 82  # problems per batch
 
 output:
-  output_dir: "./results/humaneval"
+  output_dir: "./results/bigcodebench_hard"
   choices_dir: "choices"
   metrics_file: "all_response_metrics.jsonl"
   strategies_file: "strategy_results.json"
@@ -57,3 +57,4 @@ openai:
   base_url: "http://localhost:8000/v1"
   api_key: "token-abc"
   timeout: 3600
+
