@@ -30,6 +30,9 @@ async def process_choice_file(choice_file: Path, problems_dict: dict,
     # Extract problem ID from filename
     problem_id = choice_file.stem.replace('_choices', '')
     
+    if problem_id.startswith('BigCodeBench_'):
+        problem_id = problem_id.replace('_', '/')
+    
     # Find matching problem
     if problem_id not in problems_dict:
         print(f"Warning: Problem {problem_id} not found in dataset")
