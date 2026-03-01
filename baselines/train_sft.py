@@ -1,148 +1,228 @@
 #!/usr/bin/env python3
 """
-Train a model to detect whether an answer is correct.
-Uses SFT with loss only on the final classification token.
-Evaluation uses best-of-N selection based on "true" token probability.
+Train a correctness verifier with TRL SFTTrainer.
+
+Approach – next-token prediction on classification tokens:
+  User  :  Problem + generated answer + "Is this answer correct?"
+  Asst  :  "true" | "false"
+
+Cross-entropy loss is computed **only** on the "true"/"false" assistant tokens
+via label masking (labels=-100 for all prompt tokens).  At eval time the model
+scores each rollout by P("true") and we pick the best-of-N.
 """
 
 import argparse
-from copy import Error
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import List, Dict
+
 import numpy as np
 import torch
-from torch.utils.data import Dataset
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    TrainingArguments,
-    Trainer,
-    DataCollatorForLanguageModeling
-)
+from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
+from datasets import Dataset as HFDataset
 from collections import defaultdict
 from tqdm import tqdm
+from baselines.data_utils import split_train_val
 
 DATA_DIR = "/efs/cactts/data"
 
 
-class CorrectnessDataset(Dataset):
-    """Dataset for training correctness detection."""
-    
-    def __init__(self, data: List[Dict], tokenizer, max_length=2048):
-        self.data = data
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        
-    def __len__(self):
-        return len(self.data)
-    
-    def __getitem__(self, idx):
-        item = self.data[idx]
-        response_text = item['response_text']
-        is_correct = item['is_correct']
-        problem = item['problem']
-        
-        label_text = "true" if is_correct else "false"
-        prompt = f"""Evaluate whether this answer is correct.
-    Problem: {problem}
-    Answer: {response_text}
-    This answer is """
-        full_text = f"{prompt}{label_text}"
-        
-        # Tokenize full text (this is ground truth)
-        full_tokens = self.tokenizer(
-            full_text, 
-            add_special_tokens=True, 
-            max_length=self.max_length, 
-            truncation=True
-        )
-        
-        # Tokenize ONLY the prompt with special tokens to see where it ends
-        prompt_tokens = self.tokenizer(
-            prompt, 
-            add_special_tokens=True,
-            truncation=False  # Don't truncate, we need accurate length
-        )
-        
-        input_ids = full_tokens['input_ids']
-        attention_mask = full_tokens['attention_mask']
-        
-        # The prompt length in full_tokens is len(prompt_tokens) - 1 because:
-        # prompt_tokens: [BOS, ...prompt..., EOS]
-        # full_tokens:   [BOS, ...prompt..., ...label..., EOS]
-        # So we exclude the EOS from prompt_tokens count
-        prompt_length = len(prompt_tokens['input_ids']) - 1
-        
-        # Create labels: -100 for prompt (no loss), actual tokens for label+EOS
-        labels = [-100] * prompt_length + input_ids[prompt_length:]
-        
+# ── ChatML fallback (for tokenizers without a built-in chat template) ─────────
+CHATML_TEMPLATE = (
+    "{% for message in messages %}"
+    "<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
+)
+
+
+def ensure_chat_template(tokenizer):
+    """Set ChatML fallback if the tokenizer has no chat template."""
+    if tokenizer.chat_template is None:
+        tokenizer.chat_template = CHATML_TEMPLATE
+
+
+# ── Custom data collator with label masking ───────────────────────────────────
+
+@dataclass
+class CompletionOnlyCollator:
+    """Pad input_ids / attention_mask / labels.  Labels use -100 for padding."""
+    tokenizer: object
+
+    def __call__(self, features: List[Dict]) -> Dict:
+        max_len = max(len(f["input_ids"]) for f in features)
+        pad_id = self.tokenizer.pad_token_id
+        batch = {"input_ids": [], "attention_mask": [], "labels": []}
+        for f in features:
+            length = len(f["input_ids"])
+            pad_len = max_len - length
+            # Left-pad so the final tokens (the ones we care about) stay at the end
+            batch["input_ids"].append([pad_id] * pad_len + f["input_ids"])
+            batch["attention_mask"].append([0] * pad_len + f["attention_mask"])
+            batch["labels"].append([-100] * pad_len + f["labels"])
         return {
-            'input_ids': torch.tensor(input_ids),
-            'attention_mask': torch.tensor(attention_mask),
-            'labels': torch.tensor(labels)
+            k: torch.tensor(v, dtype=torch.long) for k, v in batch.items()
         }
 
+
+# ── data loading ──────────────────────────────────────────────────────────────
+
 def load_jsonl(filepath: str) -> List[Dict]:
-    """Load data from JSONL file."""
+    """Load data from JSONL file, skipping malformed lines."""
     data = []
-    try:
-        with open(filepath, 'r') as f:
-            for line in f:
+    skipped = 0
+    with open(filepath, "r") as f:
+        for i, line in enumerate(f, 1):
+            try:
                 data.append(json.loads(line))
-    except FileNotFoundError:
-        raise FileNotFoundError(f"File not found: {filepath}")
+            except json.JSONDecodeError as e:
+                skipped += 1
+                print(f"WARNING: skipping malformed JSON in {filepath} line {i}: {e}")
+    if skipped:
+        print(f"  → loaded {len(data)} records, skipped {skipped}")
     return data
 
 
-def load_data(model_name, dataset_name, turn):
-    filepath = os.path.join(DATA_DIR, f"{model_name}/{dataset_name}/turn{turn}/all_response_metrics.jsonl")
+def load_data(model_name: str, dataset_name: str, turn: int) -> List[Dict]:
+    """Load response metrics and join with problem text."""
+    filepath = os.path.join(
+        DATA_DIR,
+        f"{model_name}/{dataset_name}/turn{turn}/all_response_metrics.jsonl",
+    )
     res = load_jsonl(filepath)
-    
-    # join with problem text from different directory
+
+    # Resolve dataset paths relative to the repo root (parent of baselines/)
+    repo_root = Path(__file__).resolve().parent.parent
+
     dataset_name_to_problems = {
-        'humaneval': "/home/ubuntu/cactts/datasets/humaneval.jsonl",
-        'kodcode': "/home/ubuntu/cactts/datasets/kodcode_1000.jsonl",
+        "humaneval": str(repo_root / "datasets" / "humaneval.jsonl"),
+        "kodcode": str(repo_root / "datasets" / "kodcode_1000.jsonl"),
     }
 
     problems = load_jsonl(dataset_name_to_problems[dataset_name])
-    problem_dict = {p['task_id']: p['prompt'] for p in problems}
-    
-    # Update each item in res with problem text
+    problem_dict = {p["task_id"]: p["prompt"] for p in problems}
+
     for item in res:
-        if dataset_name == 'humaneval':
-            problem_id = item['problem_id'].replace('_', '/')
-        item['problem'] = problem_dict.get(problem_id, "Unknown Problem")
-    
+        problem_id = item["problem_id"]
+        if dataset_name == "humaneval":
+            problem_id = problem_id.replace("_", "/")
+        item["problem"] = problem_dict.get(problem_id, "Unknown Problem")
+
     return res
 
-def train_model(train_data: List[Dict], model_name: str, output_dir: str, 
-                seed: int, gpu_id: int):
-    """Train the model on the training data."""
-    
-    # Set environment variable for GPU
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
-    
-    # Set seed
+
+# ── chat-formatted dataset ───────────────────────────────────────────────────
+
+USER_TEMPLATE = (
+    "Problem: {problem}\n"
+    "Answer: {response_text}\n"
+    "Is this answer correct?"
+)
+
+
+def build_tokenized_dataset(
+    data: List[Dict], tokenizer, max_seq_length: int = 2048,
+) -> HFDataset:
+    """
+    Build a HuggingFace Dataset with ``input_ids``, ``attention_mask``, and
+    ``labels`` columns.  Labels are -100 for all prompt tokens so loss is only
+    computed on the assistant's "true"/"false" response.
+    """
+    all_input_ids, all_attn, all_labels = [], [], []
+
+    for item in data:
+        label_text = "true" if item["is_correct"] else "false"
+        user_content = USER_TEMPLATE.format(
+            problem=item["problem"],
+            response_text=item["response_text"],
+        )
+
+        # Prompt = everything up to (and including) the assistant header
+        prompt_text = tokenizer.apply_chat_template(
+            [{"role": "user", "content": user_content}],
+            tokenize=False, add_generation_prompt=True,
+        )
+        # Full = prompt + assistant response + any EOS / closing tokens
+        full_text = tokenizer.apply_chat_template(
+            [
+                {"role": "user", "content": user_content},
+                {"role": "assistant", "content": label_text},
+            ],
+            tokenize=False, add_generation_prompt=False,
+        )
+
+        prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
+        full_ids = tokenizer.encode(full_text, add_special_tokens=False)
+
+        # Truncate to max_seq_length
+        full_ids = full_ids[:max_seq_length]
+        prompt_len = min(len(prompt_ids), len(full_ids))
+
+        # Labels: -100 for prompt, real ids for completion (shifted by trainer)
+        labels = [-100] * prompt_len + full_ids[prompt_len:]
+        assert len(labels) == len(full_ids)
+
+        all_input_ids.append(full_ids)
+        all_attn.append([1] * len(full_ids))
+        all_labels.append(labels)
+
+    return HFDataset.from_dict(
+        {"input_ids": all_input_ids, "attention_mask": all_attn, "labels": all_labels}
+    )
+
+
+# ── training ──────────────────────────────────────────────────────────────────
+
+def train_model(
+    train_data: List[Dict],
+    val_data: List[Dict],
+    model_name: str,
+    output_dir: str,
+    seed: int,
+    gpu_id: int,
+    max_seq_length: int = 2048,
+) -> str:
+    """Fine-tune with Trainer.  Loss only on the assistant token."""
+
     torch.manual_seed(seed)
     np.random.seed(seed)
-    
-    # Load model and tokenizer
+
+    # ── tokenizer ──
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    
+    tokenizer.padding_side = "left"  # match left-pad in collator
+    ensure_chat_template(tokenizer)
+
+    # ── model ──
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16,
-        device_map="auto"
+        device_map="auto",
     )
-    
-    # Create dataset
-    train_dataset = CorrectnessDataset(train_data, tokenizer)
-    
-    # Training arguments
+
+    # Log token info
+    true_ids = tokenizer.encode("true", add_special_tokens=False)
+    false_ids = tokenizer.encode("false", add_special_tokens=False)
+    print(f"'true'  token ids: {true_ids}")
+    print(f"'false' token ids: {false_ids}")
+
+    # ── dataset (pre-tokenized with label masking) ──
+    dataset = build_tokenized_dataset(train_data, tokenizer, max_seq_length)
+    val_dataset = build_tokenized_dataset(val_data, tokenizer, max_seq_length)
+    print(f"Training examples: {len(dataset)}, Validation examples: {len(val_dataset)}")
+    # Show a decoded sample so we can verify formatting
+    sample_ids = dataset[0]["input_ids"]
+    sample_labels = dataset[0]["labels"]
+    print(f"Sample prompt + response:\n{tokenizer.decode(sample_ids)[:500]}")
+    n_train_tokens = sum(1 for l in sample_labels if l != -100)
+    print(f"Tokens with loss in first example: {n_train_tokens}")
+
+    collator = CompletionOnlyCollator(tokenizer=tokenizer)
+
+    # ── training config ──
     training_args = TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=3,
@@ -151,256 +231,245 @@ def train_model(train_data: List[Dict], model_name: str, output_dir: str,
         learning_rate=2e-5,
         warmup_steps=100,
         logging_steps=50,
+        eval_strategy="epoch",
         save_strategy="epoch",
-        bf16=False,
-        fp16=True,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        bf16=True,
         seed=seed,
-        report_to="none"
+        report_to="none",
+        remove_unused_columns=False,
     )
-    
-    # Data collator
-    data_collator = DataCollatorForLanguageModeling(
-        tokenizer=tokenizer,
-        mlm=False
-    )
-    
-    # Trainer
+
+    # ── trainer ──
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=train_dataset,
-        data_collator=data_collator,
+        train_dataset=dataset,
+        eval_dataset=val_dataset,
+        data_collator=collator,
     )
-    
-    # Train
+
     trainer.train()
-    
-    # Save final model
     trainer.save_model(output_dir)
     tokenizer.save_pretrained(output_dir)
-    
     return output_dir
 
 
-def evaluate_best_of_n(model_dir: str, test_data: List[Dict], gpu_id: int) -> float:
+# ── evaluation ────────────────────────────────────────────────────────────────
+
+def evaluate_best_of_n(
+    model_dir: str, test_data: List[Dict], gpu_id: int,
+) -> float:
     """
-    Evaluate using best-of-N selection.
-    For each problem, select rollout with highest probability of "true" token.
-    If no rollout predicts "true", select the one with lowest probability of "false".
+    Best-of-N selection: for each problem pick the rollout whose next-token
+    probability of "true" is highest.  Falls back to lowest P("false") when
+    every rollout predicts "false".
     """
-    
-    # Set GPU
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
-    
-    # Load model and tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    ensure_chat_template(tokenizer)
+
     model = AutoModelForCausalLM.from_pretrained(
         model_dir,
         torch_dtype=torch.bfloat16,
-        device_map="auto"
+        device_map="auto",
     )
     model.eval()
-    
-    # Get token IDs for "true" and "false"
+
     true_token_id = tokenizer.encode("true", add_special_tokens=False)[0]
     false_token_id = tokenizer.encode("false", add_special_tokens=False)[0]
-    
-    # Group by problem_id
+
+    # Group rollouts by problem
     problems = defaultdict(list)
     for item in test_data:
-        problems[item['problem_id']].append(item)
-    
+        problems[item["problem_id"]].append(item)
+
     correct_predictions = 0
     total_problems = 0
-    
+
     with torch.no_grad():
         for problem_id, rollouts in tqdm(problems.items(), desc="Evaluating"):
             rollout_scores = []
-            
-            # Evaluate each rollout for this problem
             for rollout in rollouts:
-                response_text = rollout['response_text']
-                problem = rollout['problem']
-                prompt = f"""Evaluate whether this answer is correct. Write 'This answer is true' or 'This answer is false'.
-Problem: {problem}
-Answer: {response_text}
-This answer is """
-                
-                # Tokenize
+                # Build the user-assistant prompt (no assistant content yet)
+                messages = [
+                    {
+                        "role": "user",
+                        "content": USER_TEMPLATE.format(
+                            problem=rollout["problem"],
+                            response_text=rollout["response_text"],
+                        ),
+                    },
+                ]
+                # add_generation_prompt=True appends the assistant header
+                prompt = tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+
                 inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-                
-                # Get logits for next token
-                outputs = model(**inputs)
-                logits = outputs.logits[0, -1, :]  # Last token logits
+                logits = model(**inputs).logits[0, -1, :]
                 probs = torch.softmax(logits, dim=-1)
-                
-                # Get probabilities of both tokens
+
                 true_prob = probs[true_token_id].item()
                 false_prob = probs[false_token_id].item()
-                
-                # Determine which token is predicted (argmax)
-                predicted_token = true_token_id if true_prob > false_prob else false_token_id
-                
-                rollout_scores.append({
-                    'rollout': rollout,
-                    'true_prob': true_prob,
-                    'false_prob': false_prob,
-                    'predicted_token': predicted_token
-                })
-            
-            # First, try to find rollouts that predict "true"
-            true_predictions = [r for r in rollout_scores if r['predicted_token'] == true_token_id]
-            
-            if true_predictions:
-                # Select the one with highest probability of "true"
-                best = max(true_predictions, key=lambda x: x['true_prob'])
-            else:
-                # All predict "false", select the one with lowest probability of "false"
-                best = min(rollout_scores, key=lambda x: x['false_prob'])
-            
-            # Check if the selected rollout is correct
-            if best['rollout']['is_correct']:
-                correct_predictions += 1
-            
-            total_problems += 1
-    
-    accuracy = correct_predictions / total_problems if total_problems > 0 else 0.0
-    return accuracy
+                predicted = true_token_id if true_prob > false_prob else false_token_id
 
+                rollout_scores.append(
+                    {
+                        "rollout": rollout,
+                        "true_prob": true_prob,
+                        "false_prob": false_prob,
+                        "predicted_token": predicted,
+                    }
+                )
+
+            # Pick best rollout
+            true_preds = [
+                r for r in rollout_scores if r["predicted_token"] == true_token_id
+            ]
+            if true_preds:
+                best = max(true_preds, key=lambda x: x["true_prob"])
+            else:
+                best = min(rollout_scores, key=lambda x: x["false_prob"])
+
+            if best["rollout"]["is_correct"]:
+                correct_predictions += 1
+            total_problems += 1
+
+    return correct_predictions / total_problems if total_problems > 0 else 0.0
+
+
+# ── per-seed entry-point ─────────────────────────────────────────────────────
 
 def process_seed(args_tuple):
-    """Process a single seed (for parallel execution)."""
-    seed, gpu_id, train_data, test_data, model_name, hf_model, turn = args_tuple
-    
+    """Process a single (seed, turn) experiment."""
+    seed, gpu_id, train_ds, test_ds, model_name, hf_model, turn = args_tuple
+
+    # Set CUDA device *before* any torch / CUDA call so the correct GPU is
+    # used from the very first allocation (critical in multiprocessing workers).
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
     try:
-        print(f"\nSeed {seed} (GPU {gpu_id}): Starting...")
-        
-        # Load data
-        train_data = load_data(model_name, train_data, turn)
-        test_data = load_data(model_name, test_data, turn)
-        
-        print(f"Seed {seed}: Loaded {len(train_data)} train samples, {len(test_data)} test samples")
-        
-        # Create output directory
-        output_dir = f"./sft_output/seed_{seed}"
-        
-        # Train model
+        print(f"\nSeed {seed}, Turn {turn} (GPU {gpu_id}): Starting...")
+
+        train_data = load_data(model_name, train_ds, turn)
+        test_data = load_data(model_name, test_ds, turn)
+
+        # Split training data into train/val by problem_id
+        train_split, val_split = split_train_val(train_data, val_ratio=0.2, random_seed=seed)
+        print(
+            f"Seed {seed}: {len(train_split)} train / {len(val_split)} val / {len(test_data)} test samples"
+        )
+
+        output_dir = f"./sft_output/seed_{seed}_turn{turn}"
+
         print(f"Seed {seed}: Training...")
-        model_dir = train_model(train_data, hf_model, output_dir, seed, gpu_id)
-        
-        # Evaluate
+        model_dir = train_model(train_split, val_split, hf_model, output_dir, seed, gpu_id)
+
         print(f"Seed {seed}: Evaluating...")
         accuracy = evaluate_best_of_n(model_dir, test_data, gpu_id)
-        
         print(f"Seed {seed}: Accuracy = {accuracy:.4f}")
-        
+
         return seed, accuracy, None
-        
     except Exception as e:
-        print(f"Seed {seed}: Error - {str(e)}")
+        print(f"Seed {seed}: Error – {e}")
         return seed, None, str(e)
 
 
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
 def main():
     parser = argparse.ArgumentParser(
-        description='Finetune model with SFT and evaluate with best-of-N'
+        description="Fine-tune a correctness verifier with TRL SFT and evaluate best-of-N"
     )
-    parser.add_argument('--train', type=str, required=True, 
-                       help='train dataset')
-    parser.add_argument('--test', type=str, required=True, 
-                       help='test dataset (humaneval or kodcode)')
-    parser.add_argument('--model', type=str, default=None,
-                       help='Base model to fine-tune')
-    parser.add_argument('--num-gpus', type=int, default=3, 
-                       help='Number of GPUs to use')
-    parser.add_argument('--sequential', action='store_true', 
-                       help='Run sequentially instead of parallel')
+    parser.add_argument("--train", type=str, required=True, help="train dataset name")
+    parser.add_argument("--test", type=str, required=True, help="test dataset name")
+    parser.add_argument("--model", type=str, default=None, help="model short name or HF id")
+    parser.add_argument("--num-gpus", type=int, default=3, help="number of GPUs")
+    parser.add_argument(
+        "--sequential", action="store_true", help="run seeds sequentially"
+    )
     args = parser.parse_args()
-    
+
     seeds = [42, 52, 62]
     turns = [1, 2, 3]
-    
+
     model_mapping = {
         "gptoss": "openai/gpt-oss-20b",
         "ollmo7b": "allenai/OLMo-2-1124-7B-Instruct",
         "qwen1_7b": "Qwen/Qwen3-1.7B",
     }
-    
-    args.hf_model = model_mapping.get(args.model, args.model) 
-    
+    args.hf_model = model_mapping.get(args.model, args.model)
+
     print(f"Train: {args.train}")
-    print(f"Test: {args.test}")
-    print(f"Model: {args.model}")
-    print(f"HF Model: {args.hf_model}")
+    print(f"Test:  {args.test}")
+    print(f"Model: {args.model}  →  {args.hf_model}")
     print(f"Seeds: {seeds}")
-    print(f"GPUs: {args.num_gpus}")
-    print("="*70)
-    
-    # Create tasks
+    print(f"GPUs:  {args.num_gpus}")
+    print("=" * 70)
+
     tasks = []
     for idx, seed in enumerate(seeds):
         for turn in turns:
             gpu_id = idx % args.num_gpus
-            tasks.append((seed, gpu_id, args.train, args.test, args.model, args.hf_model, turn))
-        
-    # Run training and evaluation
+            tasks.append(
+                (seed, gpu_id, args.train, args.test, args.model, args.hf_model, turn)
+            )
+
     results = []
     if args.sequential:
         for task in tasks:
-            result = process_seed(task)
-            results.append(result)
+            results.append(process_seed(task))
     else:
         import multiprocessing as mp
-        print(f"\nStarting parallel processing with {args.num_gpus} GPUs...")
+
+        print(f"\nParallel processing with {args.num_gpus} GPUs...")
         with mp.Pool(processes=min(len(tasks), args.num_gpus)) as pool:
             results = pool.map(process_seed, tasks)
-    
-    # Process results
-    print(f"\n{'='*70}")
+
+    # ── report ──
+    print(f"\n{'=' * 70}")
     print("RESULTS")
-    print(f"{'='*70}")
-    
+    print(f"{'=' * 70}")
+
     accuracies = []
     for seed, accuracy, error in results:
         if error:
-            print(f"Seed {seed}: Error - {error}")
+            print(f"Seed {seed}: Error – {error}")
         else:
             print(f"Seed {seed}: Accuracy = {accuracy:.4f}")
             accuracies.append(accuracy)
-    
-    # Compute statistics
-    if len(accuracies) > 0:
+
+    if accuracies:
         mean_acc = np.mean(accuracies)
         std_acc = np.std(accuracies)
-        
-        print(f"\n{'='*70}")
+
+        print(f"\n{'=' * 70}")
         print("FINAL RESULTS")
-        print(f"{'='*70}")
+        print(f"{'=' * 70}")
         print(f"Best-of-N Accuracy: {mean_acc:.4f} ± {std_acc:.4f}")
-        print(f"Total experiments: {len(seeds)}")
-        
-        # Save results
+        print(f"Total experiments: {len(accuracies)}")
+
         train_name = Path(args.train).stem
         test_name = Path(args.test).stem
         output_file = f"results_sft_{train_name}_{test_name}.txt"
-        
-        with open(output_file, 'w') as f:
-            f.write(f"Finetuned SFT Results\n")
-            f.write(f"{'='*70}\n")
+
+        with open(output_file, "w") as f:
+            f.write("TRL SFT Correctness-Verifier Results\n")
+            f.write(f"{'=' * 70}\n")
             f.write(f"Train: {args.train}\n")
-            f.write(f"Test: {args.test}\n")
-            f.write(f"Model: {args.model}\n")
-            f.write(f"Seeds: {seeds}\n")
-            f.write(f"\n")
+            f.write(f"Test:  {args.test}\n")
+            f.write(f"Model: {args.hf_model}\n")
+            f.write(f"Seeds: {seeds}\n\n")
             f.write(f"Best-of-N Accuracy: {mean_acc:.4f} ± {std_acc:.4f}\n")
             f.write(f"\nIndividual results:\n")
             for seed, accuracy, error in results:
                 if error:
-                    f.write(f"  Seed {seed}: Error - {error}\n")
+                    f.write(f"  Seed {seed}: Error – {error}\n")
                 else:
                     f.write(f"  Seed {seed}: {accuracy:.4f}\n")
-            f.write(f"{'='*70}\n")
-        
+            f.write(f"{'=' * 70}\n")
+
         print(f"\nResults saved to {output_file}")
     else:
         print("\nNo successful experiments completed.")
