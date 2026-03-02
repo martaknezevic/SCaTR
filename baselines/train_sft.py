@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Train a correctness verifier with TRL SFTTrainer.
+Train a correctness verifier with LoRA-based parameter-efficient fine-tuning.
 
 Approach – next-token prediction on classification tokens:
   User  :  Problem + generated answer + "Is this answer correct?"
@@ -13,7 +13,9 @@ scores each rollout by P("true") and we pick the best-of-N.
 
 import argparse
 import json
+import math
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict
@@ -21,10 +23,13 @@ from typing import List, Dict
 import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
+from transformers.trainer_callback import PrinterCallback, ProgressCallback
 from datasets import Dataset as HFDataset
 from collections import defaultdict
 from tqdm import tqdm
-from baselines.data_utils import split_train_val
+from peft import LoraConfig, get_peft_model, PeftModel
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from data_utils import split_train_val
 
 DATA_DIR = "/efs/cactts/data"
 
@@ -203,6 +208,18 @@ def train_model(
         device_map="auto",
     )
 
+    # ── LoRA configuration ──
+    lora_config = LoraConfig(
+        r=16,  # rank
+        lora_alpha=32,  # scaling factor
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()
+
     # Log token info
     true_ids = tokenizer.encode("true", add_special_tokens=False)
     false_ids = tokenizer.encode("false", add_special_tokens=False)
@@ -222,6 +239,24 @@ def train_model(
 
     collator = CompletionOnlyCollator(tokenizer=tokenizer)
 
+    # ── compute expected steps for user info ──
+    num_examples = len(dataset)
+    batch_size = 8
+    grad_accum = 4
+    num_epochs = 1
+    steps_per_epoch = math.ceil(num_examples / batch_size) // grad_accum
+    total_steps = steps_per_epoch * num_epochs
+    print(f"\n{'─' * 50}")
+    print(f"Training config:")
+    print(f"  Examples:           {num_examples}")
+    print(f"  Batch size:         {batch_size} × {grad_accum} grad accum = {batch_size * grad_accum} effective")
+    print(f"  Steps per epoch:    {steps_per_epoch}")
+    print(f"  Total steps:        {total_steps} ({num_epochs} epochs)")
+    print(f"  Checkpoints saved:  {output_dir}/checkpoint-{{step}}")
+    print(f"  Final model saved:  {output_dir}")
+    print(f"{'─' * 50}\n")
+    sys.stdout.flush()
+
     # ── training config ──
     training_args = TrainingArguments(
         output_dir=output_dir,
@@ -230,7 +265,8 @@ def train_model(
         gradient_accumulation_steps=4,
         learning_rate=2e-5,
         warmup_steps=100,
-        logging_steps=50,
+        logging_steps=10,
+        logging_strategy="steps",
         eval_strategy="epoch",
         save_strategy="epoch",
         load_best_model_at_end=True,
@@ -239,6 +275,7 @@ def train_model(
         seed=seed,
         report_to="none",
         remove_unused_columns=False,
+        disable_tqdm=False,
     )
 
     # ── trainer ──
@@ -251,8 +288,11 @@ def train_model(
     )
 
     trainer.train()
+    print(f"\nTraining complete. Saving final model to {output_dir}")
     trainer.save_model(output_dir)
     tokenizer.save_pretrained(output_dir)
+    print(f"Model saved to {output_dir}")
+    sys.stdout.flush()
     return output_dir
 
 
@@ -269,11 +309,13 @@ def evaluate_best_of_n(
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     ensure_chat_template(tokenizer)
 
-    model = AutoModelForCausalLM.from_pretrained(
+    # Load base model and LoRA adapters
+    base_model = AutoModelForCausalLM.from_pretrained(
         model_dir,
         torch_dtype=torch.bfloat16,
         device_map="auto",
     )
+    model = PeftModel.from_pretrained(base_model, model_dir)
     model.eval()
 
     true_token_id = tokenizer.encode("true", add_special_tokens=False)[0]
@@ -380,7 +422,7 @@ def process_seed(args_tuple):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Fine-tune a correctness verifier with TRL SFT and evaluate best-of-N"
+        description="Fine-tune a correctness verifier with LoRA and evaluate best-of-N"
     )
     parser.add_argument("--train", type=str, required=True, help="train dataset name")
     parser.add_argument("--test", type=str, required=True, help="test dataset name")
@@ -422,6 +464,7 @@ def main():
             results.append(process_seed(task))
     else:
         import multiprocessing as mp
+        mp.set_start_method("spawn", force=True)
 
         print(f"\nParallel processing with {args.num_gpus} GPUs...")
         with mp.Pool(processes=min(len(tasks), args.num_gpus)) as pool:
@@ -455,7 +498,7 @@ def main():
         output_file = f"results_sft_{train_name}_{test_name}.txt"
 
         with open(output_file, "w") as f:
-            f.write("TRL SFT Correctness-Verifier Results\n")
+            f.write("LoRA-based Correctness-Verifier Results\n")
             f.write(f"{'=' * 70}\n")
             f.write(f"Train: {args.train}\n")
             f.write(f"Test:  {args.test}\n")
