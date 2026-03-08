@@ -30,8 +30,9 @@ from tqdm import tqdm
 from peft import LoraConfig, get_peft_model, PeftModel
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from data_utils import split_train_val
+from profiler import FlopsTimingCallback
 
-DATA_DIR = "/efs/cactts/data"
+DATA_DIR = "../../inference/rollouts"
 
 
 # ── ChatML fallback (for tokenizers without a built-in chat template) ─────────
@@ -94,7 +95,7 @@ def load_data(model_name: str, dataset_name: str, turn: int) -> List[Dict]:
     """Load response metrics and join with problem text."""
     filepath = os.path.join(
         DATA_DIR,
-        f"{model_name}/{dataset_name}/turn{turn}/all_response_metrics.jsonl",
+        f"{model_name}_{dataset_name}/{model_name}/{dataset_name}/turn{turn}/all_response_metrics.jsonl",
     )
     res = load_jsonl(filepath)
 
@@ -123,12 +124,12 @@ def load_data(model_name: str, dataset_name: str, turn: int) -> List[Dict]:
 USER_TEMPLATE = (
     "Problem: {problem}\n"
     "Answer: {response_text}\n"
-    "Is this answer correct?"
+    "Is this answer correct? Respond with true or false."
 )
 
 
 def build_tokenized_dataset(
-    data: List[Dict], tokenizer, max_seq_length: int = 2048,
+    data: List[Dict], tokenizer, max_seq_len: int = 16384
 ) -> HFDataset:
     """
     Build a HuggingFace Dataset with ``input_ids``, ``attention_mask``, and
@@ -139,9 +140,16 @@ def build_tokenized_dataset(
 
     for item in data:
         label_text = "true" if item["is_correct"] else "false"
+        
+        response_text_ids = tokenizer.encode(item["response_text"], add_special_tokens=False)
+        if len(response_text_ids) > max_seq_len:
+            response_text = tokenizer.decode(response_text_ids[-max_seq_len:], skip_special_tokens=True)
+        else:
+            response_text = item["response_text"]
+        
         user_content = USER_TEMPLATE.format(
             problem=item["problem"],
-            response_text=item["response_text"],
+            response_text=response_text, 
         )
 
         # Prompt = everything up to (and including) the assistant header
@@ -155,14 +163,14 @@ def build_tokenized_dataset(
                 {"role": "user", "content": user_content},
                 {"role": "assistant", "content": label_text},
             ],
-            tokenize=False, add_generation_prompt=False,
+            tokenize=False, add_generation_prompt=False
         )
+        
+        full_text = full_text.replace('assistant\n<think>\n\n</think>\n', f'assistant') # remove thinking tags
 
         prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
         full_ids = tokenizer.encode(full_text, add_special_tokens=False)
 
-        # Truncate to max_seq_length
-        full_ids = full_ids[:max_seq_length]
         prompt_len = min(len(prompt_ids), len(full_ids))
 
         # Labels: -100 for prompt, real ids for completion (shifted by trainer)
@@ -186,8 +194,8 @@ def train_model(
     model_name: str,
     output_dir: str,
     seed: int,
-    gpu_id: int,
-    max_seq_length: int = 2048,
+    bs: int = 1,
+    grad_accumulation_steps: int = 16,
 ) -> str:
     """Fine-tune with Trainer.  Loss only on the assistant token."""
 
@@ -219,6 +227,8 @@ def train_model(
     )
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
+    
+    flops_callback = FlopsTimingCallback(model, output_dir=output_dir, profile_step=5)
 
     # Log token info
     true_ids = tokenizer.encode("true", add_special_tokens=False)
@@ -227,8 +237,8 @@ def train_model(
     print(f"'false' token ids: {false_ids}")
 
     # ── dataset (pre-tokenized with label masking) ──
-    dataset = build_tokenized_dataset(train_data, tokenizer, max_seq_length)
-    val_dataset = build_tokenized_dataset(val_data, tokenizer, max_seq_length)
+    dataset = build_tokenized_dataset(train_data, tokenizer, max_seq_len=16384)
+    val_dataset = build_tokenized_dataset(val_data, tokenizer, max_seq_len=16384)
     print(f"Training examples: {len(dataset)}, Validation examples: {len(val_dataset)}")
     # Show a decoded sample so we can verify formatting
     sample_ids = dataset[0]["input_ids"]
@@ -238,11 +248,15 @@ def train_model(
     print(f"Tokens with loss in first example: {n_train_tokens}")
 
     collator = CompletionOnlyCollator(tokenizer=tokenizer)
+    
+    #get max sequence length from train data
+    max_seq_len = max(len(f["input_ids"]) for f in dataset)
+    print(f"Max sequence length in training data: {max_seq_len}")
 
-    # ── compute expected steps for user info ──
+    # ── compute expected steps for user info ── 
     num_examples = len(dataset)
-    batch_size = 8
-    grad_accum = 4
+    batch_size = bs
+    grad_accum = grad_accumulation_steps
     num_epochs = 1
     steps_per_epoch = math.ceil(num_examples / batch_size) // grad_accum
     total_steps = steps_per_epoch * num_epochs
@@ -260,17 +274,17 @@ def train_model(
     # ── training config ──
     training_args = TrainingArguments(
         output_dir=output_dir,
-        num_train_epochs=3,
-        per_device_train_batch_size=4,
-        gradient_accumulation_steps=4,
+        num_train_epochs=num_epochs,
+        per_device_train_batch_size=batch_size,
+        gradient_accumulation_steps=grad_accum,
         learning_rate=2e-5,
         warmup_steps=100,
         logging_steps=10,
         logging_strategy="steps",
-        eval_strategy="epoch",
+        #eval_strategy="epoch",
         save_strategy="epoch",
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
+        #load_best_model_at_end=True,
+        #metric_for_best_model="eval_loss",
         bf16=True,
         seed=seed,
         report_to="none",
@@ -283,8 +297,9 @@ def train_model(
         model=model,
         args=training_args,
         train_dataset=dataset,
-        eval_dataset=val_dataset,
+        #eval_dataset=val_dataset,
         data_collator=collator,
+        callbacks=[flops_callback]
     )
 
     trainer.train()
@@ -293,27 +308,29 @@ def train_model(
     tokenizer.save_pretrained(output_dir)
     print(f"Model saved to {output_dir}")
     sys.stdout.flush()
+    
+    del trainer
+    del model
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    print(f"GPU memory after cleanup: {torch.cuda.memory_allocated()/1e9:.1f}GB")
     return output_dir
 
 
 # ── evaluation ────────────────────────────────────────────────────────────────
 
 def evaluate_best_of_n(
-    model_dir: str, test_data: List[Dict], gpu_id: int,
+    hf_model, model_dir: str, test_data: List[Dict], gpu_id: int,
+    batch_size: int = 32,
 ) -> float:
-    """
-    Best-of-N selection: for each problem pick the rollout whose next-token
-    probability of "true" is highest.  Falls back to lowest P("false") when
-    every rollout predicts "false".
-    """
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    tokenizer.padding_side = "left"  # critical for causal LM batching
     ensure_chat_template(tokenizer)
 
-    # Load base model and LoRA adapters
     base_model = AutoModelForCausalLM.from_pretrained(
-        model_dir,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
+        hf_model, torch_dtype=torch.bfloat16, device_map="auto",
     )
     model = PeftModel.from_pretrained(base_model, model_dir)
     model.eval()
@@ -321,63 +338,71 @@ def evaluate_best_of_n(
     true_token_id = tokenizer.encode("true", add_special_tokens=False)[0]
     false_token_id = tokenizer.encode("false", add_special_tokens=False)[0]
 
-    # Group rollouts by problem
-    problems = defaultdict(list)
+    # ── build ALL prompts upfront ──────────────────────────────────────────
+    all_prompts = []
+    all_items   = []
     for item in test_data:
-        problems[item["problem_id"]].append(item)
+        messages = [{"role": "user", "content": USER_TEMPLATE.format(
+            problem=item["problem"],
+            response_text=item["response_text"],
+        )}]
+        prompt = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        
+        if 'gpt' in hf_model.lower():
+            prompt += '<|channel|>final<|message|>'
+        
+        all_prompts.append(prompt)
+        all_items.append(item)
 
-    correct_predictions = 0
-    total_problems = 0
+    # ── batched forward passes ─────────────────────────────────────────────
+    all_true_probs  = []
+    all_false_probs = []
 
     with torch.no_grad():
-        for problem_id, rollouts in tqdm(problems.items(), desc="Evaluating"):
-            rollout_scores = []
-            for rollout in rollouts:
-                # Build the user-assistant prompt (no assistant content yet)
-                messages = [
-                    {
-                        "role": "user",
-                        "content": USER_TEMPLATE.format(
-                            problem=rollout["problem"],
-                            response_text=rollout["response_text"],
-                        ),
-                    },
-                ]
-                # add_generation_prompt=True appends the assistant header
-                prompt = tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
-                )
+        for i in tqdm(range(0, len(all_prompts), batch_size), desc="Evaluating"):
+            batch_prompts = all_prompts[i : i + batch_size]
 
-                inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-                logits = model(**inputs).logits[0, -1, :]
-                probs = torch.softmax(logits, dim=-1)
+            inputs = tokenizer(
+                batch_prompts,
+                return_tensors="pt",
+                padding=True,          # left-pad to same length
+                truncation=True,
+            ).to(model.device)
 
-                true_prob = probs[true_token_id].item()
-                false_prob = probs[false_token_id].item()
-                predicted = true_token_id if true_prob > false_prob else false_token_id
+            # logits[:, -1, :] = next-token distribution for every item in batch
+            logits = model(**inputs).logits[:, -1, :]
+            probs  = torch.softmax(logits, dim=-1)
 
-                rollout_scores.append(
-                    {
-                        "rollout": rollout,
-                        "true_prob": true_prob,
-                        "false_prob": false_prob,
-                        "predicted_token": predicted,
-                    }
-                )
+            all_true_probs.extend(probs[:, true_token_id].cpu().tolist())
+            all_false_probs.extend(probs[:, false_token_id].cpu().tolist())
 
-            # Pick best rollout
-            true_preds = [
-                r for r in rollout_scores if r["predicted_token"] == true_token_id
-            ]
-            if true_preds:
-                best = max(true_preds, key=lambda x: x["true_prob"])
-            else:
-                best = min(rollout_scores, key=lambda x: x["false_prob"])
+    # ── best-of-N selection ────────────────────────────────────────────────
+    # Re-group by problem_id using indices
+    problems = defaultdict(list)
+    for idx, item in enumerate(all_items):
+        problems[item["problem_id"]].append({
+            "rollout":    item,
+            "true_prob":  all_true_probs[idx],
+            "false_prob": all_false_probs[idx],
+            "predicted_token": true_token_id if all_true_probs[idx] > all_false_probs[idx] else false_token_id,
+        })
 
-            if best["rollout"]["is_correct"]:
-                correct_predictions += 1
-            total_problems += 1
+    correct_predictions = 0
+    total_problems      = 0
+    for problem_id, rollout_scores in problems.items():
+        true_preds = [r for r in rollout_scores if r["predicted_token"] == true_token_id]
+        if true_preds:
+            best = max(true_preds, key=lambda x: x["true_prob"])
+        else:
+            best = min(rollout_scores, key=lambda x: x["false_prob"])
 
+        if best["rollout"]["is_correct"]:
+            correct_predictions += 1
+        total_problems += 1
+
+    print(f"\nEvaluation complete. {correct_predictions}/{total_problems} = {correct_predictions/total_problems:.2%}")
     return correct_predictions / total_problems if total_problems > 0 else 0.0
 
 
@@ -385,11 +410,7 @@ def evaluate_best_of_n(
 
 def process_seed(args_tuple):
     """Process a single (seed, turn) experiment."""
-    seed, gpu_id, train_ds, test_ds, model_name, hf_model, turn = args_tuple
-
-    # Set CUDA device *before* any torch / CUDA call so the correct GPU is
-    # used from the very first allocation (critical in multiprocessing workers).
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    seed, gpu_id, train_ds, test_ds, model_name, hf_model, turn, bs, grad_accumulation_steps = args_tuple
 
     try:
         print(f"\nSeed {seed}, Turn {turn} (GPU {gpu_id}): Starting...")
@@ -399,17 +420,32 @@ def process_seed(args_tuple):
 
         # Split training data into train/val by problem_id
         train_split, val_split = split_train_val(train_data, val_ratio=0.2, random_seed=seed)
+        ############### FOR NOW ################################
+        train_split = train_data  # TEMP: use all data for training and don't do validation and early stopping
+        #########################################################
         print(
             f"Seed {seed}: {len(train_split)} train / {len(val_split)} val / {len(test_data)} test samples"
         )
+        
+        #print distributions of correct/incorrect in train/val/test
+        def print_distribution(name, data):
+            correct = sum(1 for d in data if d["is_correct"])
+            incorrect = len(data) - correct
+            print(f"{name} distribution: {correct} correct / {incorrect} incorrect ({correct/len(data):.2%} correct)")
+        
+        print_distribution("Train", train_split)
+        print_distribution("Validation", val_split)
+        print_distribution("Test", test_data)
 
-        output_dir = f"./sft_output/seed_{seed}_turn{turn}"
-
+        #return seed, None, None  # TEMP: skip training/eval to test data loading and distribution printing
+        
+        output_dir = f"./sft_output/{model_name}_{train_ds}_{test_ds}/seed_{seed}_turn{turn}"
+    
         print(f"Seed {seed}: Training...")
-        model_dir = train_model(train_split, val_split, hf_model, output_dir, seed, gpu_id)
+        model_dir = train_model(train_split, val_split, hf_model, output_dir, seed, bs, grad_accumulation_steps)
 
         print(f"Seed {seed}: Evaluating...")
-        accuracy = evaluate_best_of_n(model_dir, test_data, gpu_id)
+        accuracy = evaluate_best_of_n(hf_model, model_dir, test_data, gpu_id, batch_size=bs)
         print(f"Seed {seed}: Accuracy = {accuracy:.4f}")
 
         return seed, accuracy, None
@@ -427,13 +463,15 @@ def main():
     parser.add_argument("--train", type=str, required=True, help="train dataset name")
     parser.add_argument("--test", type=str, required=True, help="test dataset name")
     parser.add_argument("--model", type=str, default=None, help="model short name or HF id")
-    parser.add_argument("--num-gpus", type=int, default=3, help="number of GPUs")
+    parser.add_argument("--num-gpus", type=int, default=1, help="number of GPUs")
+    parser.add_argument("--bs", type=int, default=1, help="per-device batch size for training")
+    parser.add_argument("--grad-accum", type=int, default=16, help="gradient accumulation steps for training")
     parser.add_argument(
         "--sequential", action="store_true", help="run seeds sequentially"
     )
     args = parser.parse_args()
 
-    seeds = [42, 52, 62]
+    seeds = [42, 52]
     turns = [1, 2, 3]
 
     model_mapping = {
@@ -455,7 +493,7 @@ def main():
         for turn in turns:
             gpu_id = idx % args.num_gpus
             tasks.append(
-                (seed, gpu_id, args.train, args.test, args.model, args.hf_model, turn)
+                (seed, gpu_id, args.train, args.test, args.model, args.hf_model, turn, args.bs, args.grad_accum)
             )
 
     results = []
