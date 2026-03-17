@@ -252,6 +252,11 @@ def train_model(
     #get max sequence length from train data
     max_seq_len = max(len(f["input_ids"]) for f in dataset)
     print(f"Max sequence length in training data: {max_seq_len}")
+    
+    # Measure FLOPs with a sample batch for accurate profiling
+    sample_input_ids = torch.tensor([dataset[0]["input_ids"]], device=model.device)
+    sample_attention_mask = torch.tensor([dataset[0]["attention_mask"]], device=model.device)
+    flops_callback.measure_with_sample(sample_input_ids, sample_attention_mask)
 
     # ── compute expected steps for user info ── 
     num_examples = len(dataset)
