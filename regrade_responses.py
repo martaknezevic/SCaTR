@@ -274,9 +274,12 @@ class ResponseRegrader:
         
         for idx, record in enumerate(metrics_records):
             problem_id = record.get('problem_id')
-            
+            if '/' in problem_id:
+                problem_id = problem_id.replace('/', '_')  # Normalize problem_id if it contains slashes
             # Find the corresponding problem
             if problem_id not in self.problems_dict:
+                print(problem_id)
+                print(list(self.problems_dict.keys())[:10])  # Print first 10 keys for debugging
                 print(f"Warning: Problem {problem_id} not found in dataset, skipping...")
                 skipped += 1
                 continue

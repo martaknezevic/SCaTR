@@ -9,7 +9,7 @@ import gzip
 from typing import List, Dict, Any
 from dataclasses import asdict
 from filelock import FileLock
-from vllm.entrypoints.openai.protocol import ChatCompletionResponseChoice
+from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionResponseChoice
 from openai.types.chat.chat_completion import Choice
 from utils import CustomChoice
 

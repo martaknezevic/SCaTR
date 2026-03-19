@@ -7,6 +7,7 @@ from typing import List, Dict, Any, Callable, Optional
 from dataclasses import dataclass
 from utils import _get_topk_probs, _get_topk_probs_np
 import math
+from types import SimpleNamespace
 
 @dataclass
 class MetricConfig:
@@ -62,12 +63,12 @@ class ConfidenceMetrics:
             #    description='Z-score normalized difference between top-1 and mean of others',
             #    uses_k=True
             #),
-            #'top_prob': MetricConfig(
-            #    name='top_prob',
-            #    compute_fn=self._compute_top_prob_confidence,
-            #    description='Top-1 probability',
-            #    uses_k=False
-            #),
+            'top_prob': MetricConfig(
+                name='top_prob',
+                compute_fn=self._compute_top_prob_confidence,
+                description='Top-1 probability',
+                uses_k=False
+            ),
             'entropy': MetricConfig(
                 name='entropy',
                 compute_fn=self._compute_entropy_uncertainty,
@@ -117,13 +118,32 @@ class ConfidenceMetrics:
         self.metrics[metric_config.name] = metric_config
     
     def compute_all_metrics(self, choice: Any, k: Optional[int] = None) -> Dict[str, List[float]]:
-        """Compute all registered metrics for a choice"""
-        if not choice.logprobs or not choice.logprobs.content:
+        
+        # handle both chat completions and completions format
+        if hasattr(choice, "assistant_tokens"):
+            # /v1/completions format — build token_data_list from attached attributes
+            token_data_list = []
+            for token, logprob, top_lps in zip(
+                choice.assistant_tokens,
+                choice.assistant_logprobs,
+                choice.assistant_top_logprobs,
+            ):
+                # build an object that mimics chat completions token data
+                token_data_list.append(SimpleNamespace(
+                    token=token,
+                    logprob=logprob,
+                    top_logprobs=[
+                        SimpleNamespace(token=t, logprob=lp)
+                        for t, lp in (top_lps or {}).items()
+                    ],
+                ))
+        elif choice.logprobs and choice.logprobs.content:
+            # /v1/chat/completions format — use as-is
+            token_data_list = choice.logprobs.content
+        else:
             return {name: [] for name in self.metrics.keys()}
-        
+
         results = {}
-        token_data_list = choice.logprobs.content
-        
         for metric_name, metric_config in self.metrics.items():
             if metric_config.uses_k:
                 results[metric_name] = metric_config.compute_fn(token_data_list, k)
@@ -138,7 +158,7 @@ class ConfidenceMetrics:
         confidences = []
         for token_data in token_data_list:
             if token_data.top_logprobs:
-                logprobs = [lp.logprob for lp in token_data.top_logprobs]
+                logprobs = sorted([lp.logprob for lp in token_data.top_logprobs], reverse=True)
                 if k is not None:
                     logprobs = logprobs[:k]
                 confidences.append(-np.mean(logprobs))
@@ -151,7 +171,7 @@ class ConfidenceMetrics:
         confidences = []
         for token_data in token_data_list:
             if token_data.top_logprobs:
-                logprobs = [lp.logprob for lp in token_data.top_logprobs]
+                logprobs = sorted([lp.logprob for lp in token_data.top_logprobs], reverse=True)
                 if k is not None:
                     logprobs = logprobs[:k]
                 confidences.append(-np.median(logprobs))
@@ -164,7 +184,7 @@ class ConfidenceMetrics:
         confidences = []
         for token_data in token_data_list:
             if token_data.top_logprobs:
-                logprobs = [lp.logprob for lp in token_data.top_logprobs]
+                logprobs = sorted([lp.logprob for lp in token_data.top_logprobs], reverse=True)
                 if k is not None:
                     logprobs = logprobs[:k]
                 confidences.append(np.var(logprobs))
@@ -177,14 +197,14 @@ class ConfidenceMetrics:
         confidences = []
         for token_data in token_data_list:
             if token_data.top_logprobs and len(token_data.top_logprobs) >= 2:
-                logprobs = [lp.logprob for lp in token_data.top_logprobs]
+                logprobs = sorted([lp.logprob for lp in token_data.top_logprobs], reverse=True)
                 confidences.append(logprobs[0] - logprobs[1])
             else:
                 confidences.append(0.0)
         return confidences
     
     def _compute_top_prob_confidence(self, token_data_list: List[Any]) -> List[float]:
-        """Top-1 probability (The probability of the most likely token)"""
+        """Top-1 probability (The probability of the chosen token)"""
         confidences = []
         for token_data in token_data_list:
             confidences.append(np.exp(token_data.logprob))
@@ -195,7 +215,7 @@ class ConfidenceMetrics:
         confidences = []
         for token_data in token_data_list:
             if token_data.top_logprobs:
-                logprobs = [lp.logprob for lp in token_data.top_logprobs]
+                logprobs = sorted([lp.logprob for lp in token_data.top_logprobs], reverse=True)
                 if k is not None:
                     logprobs = logprobs[:k]
                 confidences.append(np.exp(-np.mean(logprobs)))
@@ -208,7 +228,7 @@ class ConfidenceMetrics:
         confidences = []
         for token_data in token_data_list:
             if token_data.top_logprobs and len(token_data.top_logprobs) > 1:
-                logprobs = [lp.logprob for lp in token_data.top_logprobs]
+                logprobs = sorted([lp.logprob for lp in token_data.top_logprobs], reverse=True)
                 if k is not None:
                     logprobs = logprobs[:k]
                 top1 = logprobs[0]
@@ -285,7 +305,7 @@ class ConfidenceMetrics:
             # 1. Prepare P (Normalized Probabilities)
             
             # Get the logprobs and K (number of top choices)
-            logprobs = np.array([lp.logprob for lp in token_data.top_logprobs])
+            logprobs = np.array(sorted([lp.logprob for lp in token_data.top_logprobs], reverse=True))
             if k is not None:
                 logprobs = logprobs[:k]
             K = len(logprobs)
@@ -418,7 +438,7 @@ class ConfidenceMetrics:
         confidences = []
         for token_data in token_data_list:
             if token_data.top_logprobs and len(token_data.top_logprobs) >= 2:
-                logprobs = [lp.logprob for lp in token_data.top_logprobs]
+                logprobs = sorted([lp.logprob for lp in token_data.top_logprobs], reverse=True)
                 # Gap is log(P1) - log(P2)
                 probs = np.exp(logprobs)
                 confidences.append(probs[0] - probs[1])
