@@ -32,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from data_utils import split_train_val
 from profiler import FlopsTimingCallback
 
-DATA_DIR = "../../inference/rollouts"
+DATA_DIR = None  # Set via command-line argument
 
 
 # ── ChatML fallback (for tokenizers without a built-in chat template) ─────────
@@ -95,7 +95,7 @@ def load_data(model_name: str, dataset_name: str, turn: int) -> List[Dict]:
     """Load response metrics and join with problem text."""
     filepath = os.path.join(
         DATA_DIR,
-        f"{model_name}_{dataset_name}/{model_name}/{dataset_name}/turn{turn}/all_response_metrics.jsonl",
+        f"{model_name}/{dataset_name}/turn{turn}/all_response_metrics.jsonl",
     )
     res = load_jsonl(filepath)
 
@@ -462,12 +462,15 @@ def process_seed(args_tuple):
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main():
+    global DATA_DIR
+    
     parser = argparse.ArgumentParser(
         description="Fine-tune a correctness verifier with LoRA and evaluate best-of-N"
     )
     parser.add_argument("--train", type=str, required=True, help="train dataset name")
     parser.add_argument("--test", type=str, required=True, help="test dataset name")
     parser.add_argument("--model", type=str, default=None, help="model short name or HF id")
+    parser.add_argument("--data-dir", type=str, default="/efs/cactts/data", help="base data directory")
     parser.add_argument("--num-gpus", type=int, default=1, help="number of GPUs")
     parser.add_argument("--bs", type=int, default=1, help="per-device batch size for training")
     parser.add_argument("--grad-accum", type=int, default=16, help="gradient accumulation steps for training")
@@ -475,6 +478,8 @@ def main():
         "--sequential", action="store_true", help="run seeds sequentially"
     )
     args = parser.parse_args()
+    
+    DATA_DIR = args.data_dir
 
     seeds = [42, 52]
     turns = [1, 2, 3]
