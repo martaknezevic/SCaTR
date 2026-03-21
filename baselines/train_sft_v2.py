@@ -1,16 +1,4 @@
 #!/usr/bin/env python3
-"""
-Train a correctness verifier with LoRA-based parameter-efficient fine-tuning.
-
-Approach – next-token prediction on classification tokens:
-  User  :  Problem + generated answer + "Is this answer correct?"
-  Asst  :  "true" | "false"
-
-Cross-entropy loss is computed **only** on the "true"/"false" assistant tokens
-via label masking (labels=-100 for all prompt tokens).  At eval time the model
-scores each rollout by P("true") and we pick the best-of-N.
-"""
-
 import argparse
 import json
 import math
