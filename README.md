@@ -110,7 +110,7 @@ python extracting_embeddings.py \
     --gpu-ids <GPUs to use>
 ```
 
-Loads the frozen LLM and extracts hidden states from the specified intermediate layers for each parsed response. Outputs are stored as `.pkl` files, one per model/dataset/turn/seed combination. This step is parallelized across GPUs — set available GPU IDs accordingly.
+Loads the frozen LLM and extracts hidden states from the specified intermediate layers for each parsed response by running a forward pass. Outputs are stored as `.pkl` files, one per model/dataset/turn/seed combination. This step is parallelized across GPUs — set available GPU IDs accordingly.
 
 ### 3. Train SCaTR Classifiers
 
@@ -132,10 +132,21 @@ Trains MLP or Transformer classifiers on the extracted embeddings and evaluates 
 - `--layer`: comma-separated layer indices to use (e.g. `24` or `12,24,36`)
 - `--model-type`: `nn` for MLP classifiers, `transformer` for attention-based classifiers
 - `--n-rollouts`: evaluate best-of-N at a fixed rollout count; omit to use all available rollouts
-- `--rollouts`: evaluate at n_rollouts ∈ {2, 4, 8, 12, all} in a single run (mutually exclusive with `--n-rollouts`)
 - `--grid`: run a random hyperparameter search instead of the default Optuna TPE search
 
 Results are written to `results/`
+
+### Provided Scripts
+
+End-to-end pipeline scripts (parse → extract → train) are provided in `scripts/scatr/`:
+
+- `scripts/scatr/run_scatr_humaneval_kodcode_qwen1_7b.sh` — Qwen-1.7B, train=HumanEval, test=KodCode
+
+Scripts can be run from any directory:
+
+```bash
+bash scripts/scatr/run_scatr_qwen1_7b.sh
+```
 
 ### Typical SCaTR Workflow
 
