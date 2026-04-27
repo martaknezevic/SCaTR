@@ -93,8 +93,8 @@ After generating and evaluating responses, the SCaTR pipeline trains lightweight
 
 ```bash
 python parse_responses.py \
-    --model <model name> \
-    --dataset <dataset name> \
+    --model <model> \
+    --dataset <dataset> \
 ```
 
 Reads raw generation output files, extracts correctness labels (`is_correct`), and structures them into per-turn, per-seed `.pkl` files consumed by downstream steps. Grader and extractor behavior follows the same config-level settings as the generation step — adjust these if the model response style requires it (e.g., use the generic extractor for Qwen 14B on AIME).
@@ -103,10 +103,10 @@ Reads raw generation output files, extracts correctness labels (`is_correct`), a
 
 ```bash
 python extracting_embeddings.py \
-    --model <model name> \
-    --dataset <dataset name> \
+    --model <model> \
+    --dataset <dataset> \
     --layers <layer indices> \
-    --embedding-types <desired embeddings>
+    --embedding-types <desired embedding type>
     --gpu-ids <GPUs to use>
 ```
 
@@ -116,24 +116,26 @@ Loads the frozen LLM and extracts hidden states from the specified intermediate 
 
 ```bash
 python scatr.py \
-    --train <train_dataset> \
-    --test <test_dataset> \
-    --model <model_name> \
-    --layer <layer_index> \
-    --type <embedding_type> \
+    --train <train dataset> \
+    --test <test dataset> \
+    --model <model> \
+    --layer <layer index> \
+    --type <embedding type> \
     --model-type <nn|transformer> \
     --n-rollouts <N> \
-    --gpu-ids <gpu_ids>
+    --gpu-ids <GPUs to use>
 ```
 
 Trains MLP or Transformer classifiers on the extracted embeddings and evaluates best-of-N selection performance. Key arguments:
 
-- `--type`: embedding aggregation strategy — `final` (last token), `last_10`, `special`, or `all`
+- `--type`: embedding aggregation strategy — `final` (last token), `mean` (mean pool), `last_10`, `attn_weighted`, `special`, or `all`
+- `--layer`: comma-separated layer indices to use (e.g. `24` or `12,24,36`)
 - `--model-type`: `nn` for MLP classifiers, `transformer` for attention-based classifiers
-- `--n-rollouts`: number of rollouts for best-of-N evaluation; omit or pass `None` for default Best-of-N
-- `--grid`: run a hyperparameter grid search (uses Optuna under the hood)
+- `--n-rollouts`: evaluate best-of-N at a fixed rollout count; omit to use all available rollouts
+- `--rollouts`: evaluate at n_rollouts ∈ {2, 4, 8, 12, all} in a single run (mutually exclusive with `--n-rollouts`)
+- `--grid`: run a random hyperparameter search instead of the default Optuna TPE search
 
-Results are written to `results_new/`
+Results are written to `results/`
 
 ### Typical SCaTR Workflow
 
@@ -146,4 +148,3 @@ After completing steps 1–5 in the generation workflow above:
 ## Baselines
 
 The LoRA and PRM baselines are in `baselines/`.
-
