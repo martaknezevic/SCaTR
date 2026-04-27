@@ -1,6 +1,8 @@
-# SCaTR
-
-This repository contains code for running code and math generation/evaluation workflows, along with dataset configs and baseline training scripts.
+# SCaTR: Simple Calibrated Test-Time Ranking
+ 
+\[[Paper](https://arxiv.org/abs/2604.16535)\]
+ 
+This is the official repository for SCaTR: Simple Calibrated Test-Time Ranking, which proposes a lightweight Best-of-N response selection method that learns a scorer from a small calibration set using intermediate hidden representations from the base LLM. This repository also contains generation/evaluation workflows, dataset configs, and baseline training scripts.
 
 ## Installation
 
