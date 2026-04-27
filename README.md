@@ -145,7 +145,7 @@ End-to-end pipeline scripts (parse → extract → train) are provided in `scrip
 Scripts can be run from any directory:
 
 ```bash
-bash scripts/scatr/run_scatr_qwen1_7b.sh
+bash scripts/scatr/run_scatr_humaneval_kodcode_qwen1_7b.sh
 ```
 
 ### Typical SCaTR Workflow
