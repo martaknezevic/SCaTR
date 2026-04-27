@@ -1,30 +1,35 @@
-# Requirements for Modular Math Evaluator
+# Core ML
+torch
+transformers
+accelerate
+trl
 
-# Core dependencies
-openai>=1.0.0
+# Data
+pandas
 numpy>=1.24.0
-pyyaml>=6.0
+pyarrow
 
-# Dataset loading
+# Experiment tracking & tuning
+optuna
+wandb
+
+# Datasets
 datasets>=2.14.0
 
-# File locking for concurrent writes
-filelock>=3.12.0
+# API & serving
+openai>=1.0.0
+fastapi
+uvicorn
+gunicorn
+aiohttp
 
-# Math grading (symbolic evaluation)
+# Math grading
 sympy>=1.12
 pylatexenc>=2.10
 
-# Optional: For better performance
-# torch>=2.0.0  # If using local models
-
-wandb
+# Utilities
+tqdm
+pyyaml>=6.0
+thop
+filelock>=3.12.0
 jsonlines
-
-gunicorn
-fastapi
-uvicorn
-aiohttp
-
-transformers
-trl
