@@ -2306,7 +2306,7 @@ def main():
     os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(str(i) for i in gpu_ids)
     gpu_ids_str = ','.join(str(i) for i in gpu_ids)
 
-    seeds = [32, 42, 52]
+    seeds = [32, 42, 52, 62, 72]
 
     global PARSED_DATA_DIR
     PARSED_DATA_DIR = Path("./parsed_data")
