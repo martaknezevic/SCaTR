@@ -3,9 +3,6 @@ import sys
 import tempfile
 import os
 import resource
-import signal
-import grp
-import pwd
 import json
 from typing import List, NamedTuple, Tuple
 from abc import ABC, abstractmethod
@@ -14,7 +11,6 @@ from typing import List, NamedTuple, Tuple
 
 class ExecuteResultReturn(NamedTuple):
     is_passing: bool
-    feedback: str
     state: Tuple[bool]
 
 
@@ -43,7 +39,6 @@ class IOTestCase(NamedTuple):
 
 class ExecuteResult(NamedTuple):
     is_passing: bool
-    feedback: str
     state: Tuple[bool, ...]
     passed_tests: List[str]
     failed_tests: List[str]
@@ -69,13 +64,14 @@ class ContestExecutor:
             
         Example:
             examples = {
-                "input": ["10 1 14\n", "20 10 50\n"], 
-                "output": ["1\n", "0\n"]
+                "inputs": ["10 1 14\n", "20 10 50\n"], 
+                "outputs": ["1\n", "0\n"]
             }
         """
+        #print(f"Testing solution with {len(examples.get('inputs', []))} example test cases...")
         test_cases = []
-        inputs = examples.get("input", [])
-        outputs = examples.get("output", [])
+        inputs = examples.get("inputs", [])
+        outputs = examples.get("outputs", [])
         
         for i, (inp, out) in enumerate(zip(inputs, outputs)):
             test_cases.append(IOTestCase(inp, out, f"Example {i+1}"))
@@ -93,6 +89,11 @@ class ContestExecutor:
         
         # Create the batch execution script
         batch_script = self._create_batch_script(func, tests)
+        print(batch_script)
+        print(f"################################################################################")
+        print(f"Executing batch script with {len(tests)} test cases")
+        print(f"Batch script preview (first 500 chars):\n{batch_script}...")
+        print(f"################################################################################")
         
         # Set up resource limits
         mem_bytes = self.memory_limit_mb * 1024 * 1024
@@ -114,7 +115,6 @@ class ContestExecutor:
             
             # Parse results
             results = self._parse_results(process.stdout, process.stderr, tests)
-            
             for i, (success, output, error) in enumerate(results):
                 test_case = tests[i]
                 
@@ -151,20 +151,7 @@ class ContestExecutor:
         is_passing = (len(failed_tests) == 0) and (len(passed_tests) == len(tests))
         state = [True] * len(passed_tests) + [False] * len(failed_tests)
         
-        # Create feedback
-        feedback_lines = []
-        if passed_tests:
-            feedback_lines.append("Passed Tests:")
-            feedback_lines.extend([f"  {test}" for test in passed_tests])
-        
-        if failed_tests:
-            if passed_tests:
-                feedback_lines.append("")
-            feedback_lines.append("Failed Tests:")
-            feedback_lines.extend([f"  {test}" for test in failed_tests])
-
-        feedback = "\n".join(feedback_lines) if feedback_lines else "No tests executed"
-        return ExecuteResult(is_passing, feedback, state, passed_tests, failed_tests)
+        return ExecuteResult(is_passing, state, passed_tests, failed_tests)
     
     def _format_for_display(self, text: str) -> str:
         """Format text for display, handling long inputs"""
@@ -183,17 +170,6 @@ class ContestExecutor:
                 # Set CPU and file limits
                 for lim, (soft, hard) in RLIMIT_SETTINGS.items():
                     resource.setrlimit(lim, (soft, hard))
-                
-                # Skip privilege dropping for compatibility
-                # In production, you might want to enable these:
-                # try:
-                #     os.setgroups([])
-                #     gid = grp.getgrnam("nogroup").gr_gid
-                #     os.setgid(gid)
-                #     uid = pwd.getpwnam("nobody").pw_uid
-                #     os.setuid(uid)
-                # except Exception:
-                #     pass
                     
             except Exception as e:
                 # If resource limits fail, continue without them (for compatibility)
@@ -277,7 +253,7 @@ print("BATCH_RESULTS_END")
         
         # Debug output to see what we received
         if not stdout.strip():
-            # print(f"DEBUG - Empty stdout! stderr: {repr(stderr)}")
+            print(f"DEBUG - Empty stdout! stderr: {repr(stderr)}")
             return [(False, "", f"No output - {stderr}") for _ in tests]
         
         try:
@@ -299,13 +275,13 @@ print("BATCH_RESULTS_END")
             return results
             
         except (ValueError, IndexError, KeyError) as e:
-            # print(f"DEBUG - Parse error: {e}")
-            # print(f"DEBUG - Stdout: {repr(stdout[:200])}")
-            # print(f"DEBUG - Stderr: {repr(stderr)}")
+            print(f"DEBUG - Parse error: {e}")
+            print(f"DEBUG - Stdout: {repr(stdout[:200])}")
+            print(f"DEBUG - Stderr: {repr(stderr)}")
             return [(False, "", f"Parse error - {stderr}") for _ in tests]
     
     
-    def execute(self, func: str, tests: str, timeout: int = 20, imports = None) -> ExecuteResult:
+    def execute(self, func: str, tests: str, timeout: int = 20, imports = None) -> ExecuteResultReturn:
         """
         Evaluates the implementation on Human-Eval Python.
 
@@ -314,12 +290,11 @@ print("BATCH_RESULTS_END")
         
         exec_result = self.test_from_examples(func, tests)
         result = exec_result.is_passing
-        feedback = exec_result.feedback
         state = exec_result.state # does not matter for this (in matters during training)
         
-        return ExecuteResultReturn(result, feedback, state)
+        return ExecuteResultReturn(result, state)
 
-    def evaluate(self, name: str, func: str, tests: str, timeout:20, imports = None) -> ExecuteResult:
+    def evaluate(self, name: str, func: str, tests: str, timeout: int = 20, imports = None) -> bool:
         """
         Evaluates the implementation on Human-Eval Python.
 
@@ -393,6 +368,5 @@ NO
 Yes
 YES"""
     
-    result = executor.test_from_examples(solution, {"input": [sample_input], "output": [expected_output]})
-    print(result.feedback)
+    result = executor.test_from_examples(solution, {"inputs": [sample_input], "outputs": [expected_output]})
     print(f"\nResult: {'ALL PASSED' if result.is_passing else 'SOME FAILED'}")

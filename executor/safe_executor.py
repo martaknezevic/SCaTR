@@ -22,10 +22,9 @@ RLIMIT_SETTINGS = {
 MAX_CAPTURE_BYTES = 10 * 1024 * 1024
 
 
-# Result of execution: pass/fail, feedback text, test states, plus detailed lists
+# Result of execution: pass/fail, test states, plus detailed lists
 class ExecuteResult(NamedTuple):
     is_passing: bool
-    feedback: str
     state: Tuple[bool, ...]
     passed_tests: List[str]
     failed_tests: List[str]
@@ -459,8 +458,6 @@ class PyExecutor(Executor):
             test.split("  #")[0] in [t.split("  #")[0] for t in passed_tests]
             for test in tests
         )
-        # Create improved feedback format
-        feedback_lines = []
 
         def filter_imports(text):
             lines = text.split("\n")
@@ -471,22 +468,7 @@ class PyExecutor(Executor):
             ]
             return "\n".join(filtered_lines)
 
-        if passed_tests:
-            feedback_lines.append("Tests Passed:")
-            feedback_lines.extend([f"{filter_imports(t)}\n" for t in passed_tests])
-        if failed_tests:
-            if passed_tests:
-                feedback_lines.append("-" * 10 + "\n")
-                feedback_lines.append("")  # Separator
-            feedback_lines.append("Tests Failed:")
-            feedback_lines.extend([f"{filter_imports(t)}\n" for t in failed_tests])
-
-        if not passed_tests and not failed_tests:
-            feedback_lines = ["No tests were executed"]
-
-        feedback = "\n".join(feedback_lines)
-
-        return ExecuteResult(is_passing, feedback, state, passed_tests, failed_tests)
+        return ExecuteResult(is_passing, state, passed_tests, failed_tests)
 
     def evaluate(
         self,
@@ -511,18 +493,16 @@ def example_func(x: int) -> int:
     test_function = "z = 3\nassert example_func(z) == 16\n\nassert example_func(2) == 4"
     tests = [
         "assert example_func(2) == 4",
-        # "assert example_func(3) == 9",
-        # "assert example_func(0) == 0",
-        # "assert example_func(0) == 4",  # This will fail
-        # 'print("Square of 5 is", example_func(5))',
+        "assert example_func(3) == 9",
+        "assert example_func(0) == 0",
+        "assert example_func(0) == 4",  # This will fail
+        'print("Square of 5 is", example_func(5))',
         # "while True: pass",  # Commented out to avoid hanging
         # 'x = "x" * (150 * 1024 * 1024); print(len(x))',  # Commented out for memory
         test_function,
     ]
     executor = PyExecutor()
     result = executor.execute(example_func, tests, timeout=10, memory_limit_mb=100)
-    print("=== Execution Feedback ===")
-    #print(result.feedback)
     print("\n=== Raw Results ===")
-    #print("Passed tests:", result.passed_tests)
-    #print("Failed tests:", result.failed_tests)
+    print("Passed tests:", result.passed_tests)
+    print("Failed tests:", result.failed_tests)

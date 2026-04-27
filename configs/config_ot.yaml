@@ -1,0 +1,43 @@
+# Configuration for MATH Dataset (Hendrycks et al.)
+# MATH problems require symbolic mathematical answers, often in LaTeX format
+
+dataset:
+  source: datasets/ot_math.jsonl #"datasets/math500_subset.jsonl"  # HuggingFace dataset or local JSON path
+  split: "test"                          # Dataset split: train, test
+  loader_type: "math"                    # Loader type: aime, math, gsm8k, generic
+
+answer_handling:
+  extractor_type: "math"                 # Extractor: aime, math, gsm8k, generic
+  grader_type: "math_grader"             # Grader: exact_match, math_grader
+  grader_params: {}                      # Additional grader parameters
+
+generation:
+  n_gen: 16                             # Number of responses to generate per problem
+  temperature: 0.6                       # Sampling temperature
+  top_logprobs: 10                       # Number of top logprobs to return per token
+  streaming: false                       # Enable streaming generation
+  system_prompt: |
+    You are solving a competition-level mathematics problem. 
+    Show your work step by step with clear mathematical reasoning.
+    Provide your final answer in LaTeX format enclosed in \boxed{...}.
+    For example: \boxed{42} or \boxed{\frac{1}{2}} or \boxed{x = 3}.
+
+evaluation:
+  tail_n: 2048                           # Window size for tail confidence metrics
+  group_size: 1024                       # Group size for group-based metrics aggregation
+
+performance:
+  max_concurrent: 20                      # Maximum number of problems to evaluate concurrently
+  batch_size: 20                       # Number of problems per batch
+
+output:
+  output_dir: "./outputs/math"           # Base output directory
+  choices_dir: "choices"                 # Subdirectory for storing full choices
+  metrics_file: "all_response_metrics.jsonl"  # File for response-level metrics
+  strategies_file: "strategy_results.json"    # File for strategy-level results
+
+openai:
+  model_id: null                         # Model ID (auto-detected if null)
+  base_url: "http://localhost:8000/v1"   # OpenAI-compatible API endpoint
+  api_key: "token-abc"                   # API key
+  timeout: 3600                          # Request timeout in seconds

@@ -1,3 +1,0 @@
-#python regenerate_metrics.py --choices_dir /efs/cactts/data/qwen1_7b/bigcodebench_hard/turn1/choices/ --dataset datasets/bigcodebench_hard.jsonl --output /efs/cactts/data/qwen1_7b/bigcodebench_hard/turn1/all_response_metrics_regenerated.jsonl --config config_bigcodebench_hard.yaml
-
-python regenerate_metrics.py --choices_dir /efs/cactts/data/qwen1_7b/humaneval/turn1/choices/ 

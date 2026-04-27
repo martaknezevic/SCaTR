@@ -7,11 +7,19 @@ import json
 import pickle
 import gzip
 from typing import List, Dict, Any
-from dataclasses import asdict
 from filelock import FileLock
-from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionResponseChoice
+
 from openai.types.chat.chat_completion import Choice
-from utils import CustomChoice
+class CustomChoice(Choice):
+    def __init__(self, rollout_idx=None, problem_id=None, **kwargs):
+        super().__init__(**kwargs)
+        self.rollout_idx = rollout_idx
+        self.problem_id = problem_id
+    
+    @classmethod
+    def from_dict(cls, data: dict):
+        """Automatically reconstruct from dictionary"""
+        return cls(**data)
 
 
 class ChoiceStorage:

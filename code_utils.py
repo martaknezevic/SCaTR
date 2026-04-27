@@ -15,41 +15,6 @@ from transformers import set_seed as hf_set_seed
 import wandb
 
 
-def create_output_dir(final_config):
-    """Create a readable output directory name with model, hops, generations, alternate optimization settings, beta, and timestamp."""
-    # Get current timestamp in readable format
-    timestamp = datetime.now().strftime(
-        "%B_%d_%Y_%I_%M%p"
-    )  # e.g., "December_25_2024_02_30PM"
-
-    # Extract model name (remove path and keep clean name)
-    model_name = final_config["model_name"].split("/")[-1]  # "Qwen2.5-1.5B-Instruct"
-
-    # Format beta value to avoid dots in folder names
-    beta_str = str(final_config["beta"]).replace(".", "p")  # 0.04 -> "0p04"
-
-    # Create readable folder name
-    folder_name = (
-        f"{model_name}_"
-        f"{final_config['num_stages']}stages_"
-        f"{final_config['num_generations']}gen__"
-        f"pru_{final_config["prune"]}__"
-        f"pru-str_{final_config["pruning_strategy"]}__"
-        f"pru-bu_{final_config["pruning_budget"]}__"
-        f"ms_baseline_{final_config["multi_stage_baseline"]}__"
-        f"beta_{beta_str}__"
-        f"{timestamp}"
-    )
-
-    # Combine with base output directory
-    output_dir = os.path.join(final_config["output_dir"], folder_name)
-
-    # Create the directory if it doesn't exist
-    os.makedirs(output_dir, exist_ok=True)
-
-    return output_dir, folder_name
-
-
 def read_jsonl(path: str) -> List[dict]:
     if not os.path.exists(path):
         raise FileNotFoundError(f"File `{path}` does not exist.")
@@ -83,11 +48,13 @@ def parse_between_output_tags_old(text):
     else:
         return text
 
+
 def parse_between_output_tags_old_v2(text):
     matches = re.findall(r"<output>(.*?)</output>", text, re.DOTALL)
     if matches:
         return matches[-1].strip()
     return text
+
 
 def parse_between_output_tags(text):
     pattern = r"<output>((?:(?!<output>).)*?)</output>"
@@ -95,9 +62,7 @@ def parse_between_output_tags(text):
 
     if matches:
         return matches[-1].strip()
-
     return text
-
 
 
 def load_yaml_config(path: str) -> dict:
@@ -135,7 +100,6 @@ def tag_count_reward(text) -> float:
 
     return count_tags(text)
 
-
 class ConfigUploadCallback(TrainerCallback):
     def __init__(self, config_to_upload):
         self.config_to_upload = config_to_upload
@@ -146,7 +110,6 @@ class ConfigUploadCallback(TrainerCallback):
             wandb.config.update(self.config_to_upload)
             print("✅ Uploaded full config to wandb")
             self.uploaded = True
-
 
 class FunctionExtractor(ast.NodeVisitor):
     def __init__(self, target: str):

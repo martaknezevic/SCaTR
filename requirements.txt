@@ -20,3 +20,11 @@ pylatexenc>=2.10
 
 wandb
 jsonlines
+
+gunicorn
+fastapi
+uvicorn
+aiohttp
+
+transformers
+trl

@@ -12,8 +12,8 @@ Key Features:
 - Clean separation of concerns with modular architecture
 
 Usage:
-    python code_evaluator.py --config config_humaneval.yaml
-    python code_evaluator.py --config config_kodcode.yaml --n_gen 20
+    python code_evaluator.py --config configs/config_humaneval.yaml
+    python code_evaluator.py --config configs/config_kodcode.yaml --n_gen 20
 """
 
 import os
@@ -26,14 +26,13 @@ import asyncio
 import argparse
 import numpy as np
 from typing import List, Dict, Any, Tuple, Optional, Union
-from dataclasses import dataclass, asdict
-from pathlib import Path
+from dataclasses import dataclass
 from abc import ABC, abstractmethod
 import aiohttp
 
 import yaml
 import openai
-from openai.types.chat import ChatCompletion, ChatCompletionMessage
+from openai.types.chat import ChatCompletionMessage
 from openai.types.chat.chat_completion import Choice, ChoiceLogprobs
 
 # Import existing components
@@ -141,6 +140,41 @@ class CodeGrader(ABC):
 # ============================================================================
 # Dataset Loaders
 # ============================================================================
+
+class OTLoader(DatasetLoader):
+    """Loader for custom JSONL dataset with id, prompt, and test_cases fields"""
+
+    def get_name(self) -> str:
+        return "OT"
+
+    def load(self, dataset_source: str, split: str = "test", **kwargs) -> List[CodeProblem]:
+        """Load from JSONL file with id, prompt, test_cases keys"""
+
+        with open(dataset_source, 'r') as f:
+            data = [json.loads(line) for line in f if line.strip()]
+
+        problems = []
+        for idx, item in enumerate(data):
+            test_cases_dict = item.get("test_cases", {})
+            if isinstance(test_cases_dict, str):
+                test_cases_dict = json.loads(test_cases_dict)  # double-parse if stored as string
+
+            inputs  = test_cases_dict.get("inputs", [])
+            outputs = test_cases_dict.get("outputs", [])
+
+            test_cases = test_cases_dict
+
+            problem = CodeProblem(
+                problem_id=str(item.get("id", f"problem_{idx}")),
+                problem_text=item.get("prompt", ""),
+                test_cases=test_cases,
+                entry_point=item.get("entry_point", ),
+                metadata=item.get("metadata", {})
+            )
+            problems.append(problem)
+
+        print(f"Loaded {len(problems)} problems from {dataset_source}")
+        return problems
 
 class HumanEvalLoader(DatasetLoader):
     """Loader for HumanEval dataset"""
@@ -430,6 +464,26 @@ class GenericCodeExtractor(CodeExtractor):
         
         # If nothing found, return the response as-is (might be plain code)
         return response_text.strip()
+    
+class HybridExtractor(CodeExtractor):
+    """Hybrid extractor that tries both <output> tags and markdown, picks best result"""
+    
+    def __init__(self, grader: ExecutorAPIGrader, execution_timeout: int = 10):
+        self.output_extractor = OutputTagExtractor()
+        self.markdown_extractor = MarkdownCodeBlockExtractor()
+        self.grader = grader
+        self.execution_timeout = execution_timeout
+    
+    def get_name(self) -> str:
+        return "Hybrid"
+    
+    def extract(self, response_text: str, entry_point: Optional[str] = None) -> Optional[str]:
+        """Synchronous extract - just try markdown first, then output tags"""
+        # This is for non-async usage
+        code = self.markdown_extractor.extract(response_text, entry_point)
+        if code:
+            return code
+        return self.output_extractor.extract(response_text, entry_point)
 
 
 # ============================================================================
@@ -439,7 +493,7 @@ class GenericCodeExtractor(CodeExtractor):
 class ExecutorAPIGrader(CodeGrader):
     """Grader using the code executor API"""
     
-    def __init__(self, executor_url: str = "http://localhost:8000/execute", 
+    def __init__(self, executor_url: str = "http://localhost:8001/execute", 
                  max_concurrent: int = 6):
         self.executor_url = executor_url
         self.semaphore = asyncio.Semaphore(max_concurrent)
@@ -450,11 +504,13 @@ class ExecutorAPIGrader(CodeGrader):
     async def grade(self, code: str, test_cases: Union[List[str], Dict[str, List[str]]], 
                     timeout: int = 10) -> Tuple[bool, str, List[float]]:
         """Grade code against test cases using executor API"""
-        
+        #print(test_cases)
         if not code:
-            num_tests = len(test_cases.get("input", [])) if isinstance(test_cases, dict) else len(test_cases)
+            num_tests = len(test_cases.get("inputs", [])) if isinstance(test_cases, dict) else len(test_cases)
             return False, "No code extracted", [0.0] * num_tests
         
+        #print(f"Grading code with {len(test_cases.get('inputs', [])) if isinstance(test_cases, dict) else len(test_cases)} test cases..."
+        #      f"Code preview (first 200 chars):\n{code[:200]}...")
         async with self.semaphore:
             try:
                 async with aiohttp.ClientSession() as session:
@@ -471,77 +527,12 @@ class ExecutorAPIGrader(CodeGrader):
                             result["partial_test_cases"],
                         )
             except Exception as e:
-                num_tests = len(test_cases.get("input", [])) if isinstance(test_cases, dict) else len(test_cases)
+                num_tests = len(test_cases.get("inputs", [])) if isinstance(test_cases, dict) else len(test_cases)
                 return (
                     False,
                     f"Execution error: {str(e)}",
                     [0.0] * num_tests,
                 )
-
-
-class HybridExtractor(CodeExtractor):
-    """Hybrid extractor that tries both <output> tags and markdown, picks best result"""
-    
-    def __init__(self, grader: ExecutorAPIGrader, execution_timeout: int = 10):
-        self.output_extractor = OutputTagExtractor()
-        self.markdown_extractor = MarkdownCodeBlockExtractor()
-        self.grader = grader
-        self.execution_timeout = execution_timeout
-    
-    def get_name(self) -> str:
-        return "Hybrid"
-    
-    async def extract_and_grade(self, response_text: str, entry_point: Optional[str], 
-                                test_cases, extractor) -> tuple:
-        """Extract code and grade it"""
-        code = extractor.extract(response_text, entry_point)
-        if not code:
-            return None, 0, []
-        
-        is_passing, feedback, partial_tests = await self.grader.grade(
-            code, test_cases, self.execution_timeout
-        )
-        
-        num_passed = int(np.sum(np.asarray(partial_tests, dtype=np.float32)))
-        
-        return code, num_passed, partial_tests
-    
-    async def extract_with_test(self, response_text: str, entry_point: Optional[str] = None,
-                               test_cases = None) -> Optional[str]:
-        """Extract using both methods and pick the one that passes more tests"""
-        if not response_text or test_cases is None:
-            # Fallback to output tag if no test cases provided
-            return self.output_extractor.extract(response_text, entry_point)
-        
-        # Try both extractors
-        output_code, output_passed, _ = await self.extract_and_grade(
-            response_text, entry_point, test_cases, self.output_extractor
-        )
-        
-        markdown_code, markdown_passed, _ = await self.extract_and_grade(
-            response_text, entry_point, test_cases, self.markdown_extractor
-        )
-        
-        # Pick the one with more tests passed
-        if output_code is None and markdown_code is None:
-            return None
-        elif output_code is None:
-            return markdown_code
-        elif markdown_code is None:
-            return output_code
-        elif markdown_passed > output_passed:
-            return markdown_code
-        else:
-            return output_code
-    
-    def extract(self, response_text: str, entry_point: Optional[str] = None) -> Optional[str]:
-        """Synchronous extract - just try markdown first, then output tags"""
-        # This is for non-async usage
-        code = self.markdown_extractor.extract(response_text, entry_point)
-        if code:
-            return code
-        return self.output_extractor.extract(response_text, entry_point)
-
 
 # ============================================================================
 # Factory Classes
@@ -554,6 +545,7 @@ class LoaderFactory:
         'humaneval': HumanEvalLoader,
         'kodcode': KodcodeLoader,
         'generic': GenericCodeLoader,
+        'ot': OTLoader,
     }
     
     @classmethod
@@ -751,23 +743,13 @@ class CodeEvaluator:
         
         return problems
     
-    def _format_prompt(self, problem: CodeProblem) -> str:
-        """Format problem text into a complete prompt"""
-        #additional_prompt = (
-        #    f"\nNote that if you don't complete thinking and the code generation "
-        #    f"within {self.config.max_completion_length} tokens, you will get a zero reward."
-        #)
-        
-        return problem.problem_text #+ additional_prompt
-    
     def _extract_message(self, choice):
         """Extract full text message from a vLLM/OpenAI-style choice object."""
         if hasattr(choice, "message") and hasattr(choice.message, "content"):
             return choice.message.content if choice.message.content else ""
         
         # Fallback: if no message content, return empty string
-        return ""
-        
+        return ""       
     
     async def generate_single_response_stream(self, config: Dict[str, Any]) -> Choice:
         """Generate a single response with streaming"""
@@ -912,9 +894,6 @@ class CodeEvaluator:
                 'is_correct': is_passing,
                 'num_tests_passed': num_passed,
                 'total_tests': total_tests,
-                #'format_reward': format_rew,
-                #'code_reward': code_rew,
-                #'total_reward': total_rew,
                 'total_tokens': total_tokens,
                 **aggregated
             }
@@ -967,9 +946,6 @@ class CodeEvaluator:
         """Evaluate a single problem"""
         print(f"\nEvaluating Problem {problem.problem_id}")
         
-        # Format prompt
-        user_prompt = self._format_prompt(problem)
-        
         # Prepare generation config
         gen_config = {
             "model": self.config.model_id,
@@ -978,7 +954,6 @@ class CodeEvaluator:
                 {"role": "system", "content": self.config.system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            # "max_tokens": self.config.max_completion_length,
             "logprobs": True,
             "top_logprobs": self.config.top_logprobs,
             "extra_body": {"reasoning_effort": "high"}

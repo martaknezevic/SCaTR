@@ -1,0 +1,54 @@
+# Configuration for HumanEval Code Evaluation
+
+dataset:
+  source: datasets/ot_code.jsonl  # HuggingFace dataset or local JSON path
+  split: "test"
+  loader_type: "ot"
+  num_samples: null  # null = use all, or specify a number
+
+code_handling:
+  extractor_type: "hybrid" # output_tag, markdown, generic
+  grader_type: "executor_api"
+  grader_params:
+    executor_url: "http://localhost:8001/execute"
+    max_concurrent: 6
+  execution_timeout: 10  # seconds per test case
+
+generation:
+  n_gen: 16                      # Number of responses to generate per problem
+  temperature: 0.6                # Sampling temperature (0.0 = greedy, higher = more random)
+  top_logprobs: 10                # Number of top logprobs to return per token
+  streaming: false                # Enable streaming generation
+  system_prompt: |
+    You are a Python coding AI agent. When given a coding problem, you must provide a complete Python solution following this exact format:
+
+    Break down the problem requirements step by step
+    Identify key constraints, edge cases, and potential pitfalls
+    Plan your algorithm and data structures
+    Walk through examples to validate your approach
+    Explain your logic thoroughly as if working on scratch paper
+
+    Ensure your code directly implements the approach from your thinking
+    Write clean, readable code with appropriate comments if needed
+
+    Your solution must be complete, correct, and handle all specified requirements.
+
+evaluation:
+  tail_n: 2048                    # Window size for tail confidence metrics
+  group_size: 1024                # Group size for group-based metrics aggregation
+
+performance:
+  max_concurrent: 25  # max concurrent problems being evaluated
+  batch_size: 82  # problems per batch
+
+output:
+  output_dir: "./results/ot"
+  choices_dir: "choices"
+  metrics_file: "all_response_metrics.jsonl"
+  strategies_file: "strategy_results.json"
+
+openai:
+  model_id: null  # null = auto-detect from server
+  base_url: "http://localhost:8000/v1"
+  api_key: "token-abc"
+  timeout: 3600

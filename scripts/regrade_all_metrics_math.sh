@@ -1,2 +1,0 @@
-python regrade_math_responses.py --loader aime --dataset MathArena/aime_2025 --split train --metrics /efs/cactts/data/ollmo7b/aime/turn1/all_response_metrics.jsonl --output /efs/cactts/data/ollmo7b/aime/turn1/all_response_metrics_regraded.jsonl --extractor generic
-python regrade_math_responses.py --loader aime --dataset MathArena/aime_2025 --split train --metrics /efs/cactts/data/ollmo7b/aime/turn2/all_response_metrics.jsonl --output /efs/cactts/data/ollmo7b/aime/turn2/all_response_metrics_regraded.jsonl --extractor generic

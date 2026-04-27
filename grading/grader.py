@@ -1,5 +1,5 @@
 """
-https://github.com/StigLidu/TURN/blob/main/MATH/math_utils/grader.py
+Taken and adapted from https://github.com/StigLidu/TURN/blob/main/MATH/math_utils/grader.py
 """
 
 import re
@@ -229,6 +229,18 @@ def split_tuple(expr: str):
         elems = [expr]
     return elems
 
+def normalize_trailing_zeros(a: str, b: str) -> tuple[str, str]:
+    """If both strings are floats, normalize trailing zeros so 0.78 == 0.780"""
+    try:
+        float(a)
+        float(b)
+    except (ValueError, TypeError):
+        return a, b  # not both floats, return unchanged
+
+    # Convert through float to strip trailing zeros
+    a = str(float(a))
+    b = str(float(b))
+    return a, b
 
 def grade_answer(given_answer: str, ground_truth: str) -> bool:
     """
@@ -239,6 +251,8 @@ def grade_answer(given_answer: str, ground_truth: str) -> bool:
     """
     if given_answer is None:
         return False
+    
+    given_answer, ground_truth = normalize_trailing_zeros(given_answer, ground_truth)
 
     ground_truth_normalized_mathd = normalize.normalize_answer(ground_truth)
     given_answer_normalized_mathd = normalize.normalize_answer(given_answer)

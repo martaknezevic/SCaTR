@@ -3,11 +3,52 @@ Confidence metrics computation module.
 Easy to extend with new metrics.
 """
 import numpy as np
-from typing import List, Dict, Any, Callable, Optional
+from typing import List, Dict, Any, Callable, Optional, Tuple
 from dataclasses import dataclass
-from utils import _get_topk_probs, _get_topk_probs_np
-import math
 from types import SimpleNamespace
+
+# Helper function for creating distribution of logprobs
+def _get_topk_probs(token_data: Any, k: Optional[int] = None) -> np.ndarray:
+    """Helper to convert top_logprobs (up to top_k) into probabilities."""
+    if not token_data.top_logprobs:
+        # Fallback if top_logprobs is not available (only main logprob is used)
+        return np.array([np.exp(token_data.logprob)])
+
+    # 1. Get the logprobs
+    logprobs = np.array(sorted([lp.logprob for lp in token_data.top_logprobs]))
+    if k is not None:
+        logprobs = logprobs[:k]
+    
+    # 2. Convert to probabilities (softmax operation)
+    # Exponentiate
+    probs = np.exp(logprobs)
+    
+    # Normalize (ensure the local distribution sums to 1)
+    sum_probs = np.sum(probs)
+    if sum_probs > 0:
+        probs /= sum_probs
+    
+    return probs
+
+
+def _get_topk_probs_np(token_data: Any, k: Optional[int] = None) -> Tuple[np.ndarray, int]:
+    """Helper to convert top_logprobs into normalized probabilities P and return K."""
+    if not token_data.top_logprobs:
+        return np.array([1.0]), 1
+
+    logprobs = np.array([lp.logprob for lp in token_data.top_logprobs])
+    K = len(logprobs)
+    
+    unnormalized_probs = np.exp(logprobs)
+    sum_probs = np.sum(unnormalized_probs)
+    
+    if sum_probs > 1e-12:
+        P = unnormalized_probs / sum_probs
+    else:
+        # Fallback to uniform if probabilities are all near-zero
+        P = np.full(K, 1.0/K)
+    
+    return P, K
 
 @dataclass
 class MetricConfig:
@@ -51,18 +92,6 @@ class ConfidenceMetrics:
                 description='Gap between top-1 and top-2 logprobs',
                 uses_k=False
             ),
-            #'exp_mean': MetricConfig(
-            #    name='exp_mean',
-            #    compute_fn=self._compute_exp_mean_confidence,
-            #    description='Exponential of mean (geometric mean in prob space)'
-            #    uses_k=True
-            #),
-            #'distinctiveness': MetricConfig(
-            #    name='distinctiveness',
-            #    compute_fn=self._compute_distinctiveness_confidence,
-            #    description='Z-score normalized difference between top-1 and mean of others',
-            #    uses_k=True
-            #),
             'top_prob': MetricConfig(
                 name='top_prob',
                 compute_fn=self._compute_top_prob_confidence,
@@ -75,36 +104,6 @@ class ConfidenceMetrics:
                 description='Normalized Entropy of top-k distribution (Higher = Higher Uncertainty)',
                 uses_k=True
             ),
-            #'perplexity': MetricConfig(
-            #    name='perplexity',
-            #    compute_fn=self._compute_perplexity_uncertainty,
-            #    description='Perplexity of top-k distribution (Higher = Higher Uncertainty)',
-            #    uses_k=True
-            #),
-            #'kl_divergence': MetricConfig(
-            #    name='kl_divergence',
-            #    compute_fn=self._compute_kl_divergence_confidence,
-            #    description='KL Divergence from top-k distribution to uniform (Higher = Higher Confidence)',
-            #    uses_k=True
-            #),
-            #'renyi_divergence': MetricConfig(
-            #    name='renyi_divergence',
-            #    compute_fn=self._compute_renyi_divergence_uncertainty,
-            #    description='Rényi Divergence (alpha=2) from top-k distribution to uniform (Higher = Higher Uncertainty)',
-            #    uses_k=True
-            #),
-            #'fisher_rao_distance': MetricConfig(
-            #    name='fisher_rao_distance',
-            #    compute_fn=self._compute_fisher_rao_distance_uncertainty,
-            #    description='Fisher-Rao Distance from top-k distribution to uniform (Higher = Higher Uncertainty)',
-            #    uses_k=True
-            #),
-            #'inverse_probability': MetricConfig(
-            #    name='inverse_probability',
-            #    compute_fn=self.compute_inverse_probability_uncertainty,
-            #    description='Inverse Probability using sampled token logprobs (Higher = Higher Uncertainty)',
-            #    uses_k=False
-            #),
             'gap_probs': MetricConfig(
                 name='gap_probs',
                 compute_fn=self._compute_gap_probs_confidence,
@@ -210,37 +209,6 @@ class ConfidenceMetrics:
             confidences.append(np.exp(token_data.logprob))
         return confidences
     
-    def _compute_exp_mean_confidence(self, token_data_list: List[Any], k: Optional[int] = None) -> List[float]:
-        """Exponential of mean (geometric mean in probability space)"""
-        confidences = []
-        for token_data in token_data_list:
-            if token_data.top_logprobs:
-                logprobs = sorted([lp.logprob for lp in token_data.top_logprobs], reverse=True)
-                if k is not None:
-                    logprobs = logprobs[:k]
-                confidences.append(np.exp(-np.mean(logprobs)))
-            else:
-                confidences.append(np.exp(-token_data.logprob))
-        return confidences
-    
-    def _compute_distinctiveness_confidence(self, token_data_list: List[Any], k: Optional[int] = None) -> List[float]:
-        """Z-score normalized difference between top-1 and mean of others"""
-        confidences = []
-        for token_data in token_data_list:
-            if token_data.top_logprobs and len(token_data.top_logprobs) > 1:
-                logprobs = sorted([lp.logprob for lp in token_data.top_logprobs], reverse=True)
-                if k is not None:
-                    logprobs = logprobs[:k]
-                top1 = logprobs[0]
-                others = logprobs[1:]
-                mean_others = np.mean(others)
-                std_all = np.std(logprobs) if np.std(logprobs) > 0 else 1e-9
-                distinctiveness = (top1 - mean_others) / std_all
-                confidences.append(np.clip(distinctiveness, -10, 10))
-            else:
-                confidences.append(0.0)
-        return confidences
-    
     def _compute_entropy_uncertainty(self, token_data_list: List[Any], k: Optional[int] = None) -> List[float]:
         """
         Normalized Entropy of the top-k probability distribution 
@@ -263,176 +231,6 @@ class ConfidenceMetrics:
             
         return uncertainties
     
-    def _compute_perplexity_uncertainty(self, token_data_list: List[Any], k: Optional[int] = None) -> List[float]:
-        """
-        Perplexity (2^Entropy) of the top-k distribution 
-        (Higher value = Higher Uncertainty).
-        Perplexity roughly estimates the effective number of choices the model has.
-        """
-        uncertainties = []
-        # Reuse the entropy calculation
-        entropy_values = self._compute_entropy_uncertainty(token_data_list, k)
-        
-        for entropy in entropy_values:
-            # Perplexity is 2^H
-            uncertainties.append(2**entropy)
-            
-        return uncertainties
-    
-    def _compute_kl_divergence_confidence(self, token_data_list: List[Any], k: Optional[int] = None) -> List[float]:
-        """
-        Computes the Kullback-Leibler (KL) Divergence from the token's top-K 
-        normalized distribution (P) to a uniform distribution (Q).
-        
-        Formula: D_KL(P || Q) = log(K) - H(P)
-        (Higher value = Higher Confidence/Peakedness)
-        
-        Args:
-            token_data_list: A list of token logprob objects for a single generation.
-            
-        Returns:
-            A list of float values representing the KL divergence for each token.
-        """
-        confidences = []
-
-        for token_data in token_data_list:
-            if not token_data.top_logprobs:
-                # If only the main logprob is available, the distribution is singular (P=1)
-                # H(P) = 0, D_KL = 0 (since K=1, log(K)=0)
-                confidences.append(0.0)
-                continue
-                
-            # 1. Prepare P (Normalized Probabilities)
-            
-            # Get the logprobs and K (number of top choices)
-            logprobs = np.array(sorted([lp.logprob for lp in token_data.top_logprobs], reverse=True))
-            if k is not None:
-                logprobs = logprobs[:k]
-            K = len(logprobs)
-            
-            # Convert log-probabilities to a normalized probability distribution P (local softmax)
-            # Exponentiate
-            unnormalized_probs = np.exp(logprobs) 
-            
-            # Normalize (ensure P sums to 1 over the top-K set)
-            sum_probs = np.sum(unnormalized_probs)
-            if sum_probs > 1e-12:  # Avoid division by zero/near-zero sum
-                P = unnormalized_probs / sum_probs
-            else:
-                confidences.append(0.0)
-                continue
-
-            # 2. Compute Shannon Entropy H(P)
-            # H(P) = -sum(P * log(P))
-            # Use np.log for natural log, and filter out near-zero probabilities
-            non_zero_P = P[P > 1e-12]
-            H_P = -np.sum(non_zero_P * np.log(non_zero_P))
-
-            # 3. Compute KL Divergence D_KL(P || Q)
-            # D_KL(P || Q) = log(K) - H(P)
-            log_K = np.log(K) # Natural log of K
-            
-            kl_divergence = log_K - H_P
-            
-            confidences.append(kl_divergence)
-            
-        return confidences
-
-    def compute_inverse_probability_uncertainty(self, token_data_list: List[Any]) -> List[float]:
-        """
-        Computes the Inverse Probability of the sampled token (1/P_l) for each token 
-        in the sequence.
-        
-        Metric calculated per token: V_l = exp(-log(P(y_l | y_<l)))
-        (Higher value = Higher Uncertainty / Lower Confidence)
-
-        Args:
-            token_data_list: A list of token logprob objects for a single generation.
-                            (Assumed to be the 'content' field from logprobs)
-            
-        Returns:
-            A list of float values representing the Inverse Probability for each token.
-        """
-        
-        if not token_data_list:
-            return []
-            
-        # Extract the log probability of the sampled token for each step
-        try:
-            # log_probs[l] = log(P(y_l | y_<l))
-            log_probs = np.array([token_data.logprob for token_data in token_data_list])
-        except AttributeError:
-            print("Error: Input list does not contain objects with a 'logprob' attribute.")
-            return [0.0] * len(token_data_list)
-
-        # 1. Calculate the Inverse Probability for each token: exp(-log P) = 1/P
-        # This results in a NumPy array of size L (sequence length)
-        inverse_probs_per_token = np.exp(-log_probs)
-        
-        # Return as a standard Python list of floats
-        return inverse_probs_per_token.tolist()
-        
-
-    def _compute_renyi_divergence_uncertainty(self, token_data_list: List[Any], k: Optional[int] = None, alpha: float = 2.0) -> List[float]:
-        """
-        Computes the per-token Rényi Divergence (alpha=2.0 by default) 
-        from the normalized P distribution to a uniform Q distribution over K.
-        (Higher value = Higher Uncertainty)
-        """
-        if alpha <= 0.0 or alpha == 1.0:
-            raise ValueError("Alpha must be > 0 and not equal to 1 for Rényi Divergence.")
-
-        uncertainties = []
-        for token_data in token_data_list:
-            P, K = _get_topk_probs_np(token_data, k)
-            
-            # If K=1, the distribution is singular, divergence is 0.
-            if K <= 1:
-                uncertainties.append(0.0)
-                continue
-                
-            # Calculate the sum term: sum(P_i^alpha)
-            sum_p_alpha = np.sum(P**alpha)
-            
-            # URD_l = log(K) + (1 / (alpha - 1)) * log(sum(P_i^alpha))
-            term1 = math.log(K)
-            term2 = (1.0 / (alpha - 1.0)) * math.log(sum_p_alpha)
-            
-            uncertainties.append(term1 + term2)
-            
-        return uncertainties
-
-# ----------------------------------------------------------------------------
-
-    def _compute_fisher_rao_distance_uncertainty(self, token_data_list: List[Any], k: Optional[int] = None) -> List[float]:
-        """
-        Computes the per-token Fisher-Rao based distance (as defined in the query)
-        from the normalized P distribution to a uniform Q distribution over K.
-        (Higher value = Higher Distance/Uncertainty)
-        """
-        uncertainties = []
-        for token_data in token_data_list:
-            P, K = _get_topk_probs_np(token_data, k)
-            
-            # If K=1, the distance is 0.
-            if K <= 1:
-                uncertainties.append(0.0)
-                continue
-                
-            # 1. Calculate the cosine similarity term: sum(sqrt(P_i) * sqrt(Q_i))
-            # Since sqrt(Q_i) = 1/sqrt(K)
-            sum_sqrt_p = np.sum(np.sqrt(P))
-            cosine_term = (1.0 / math.sqrt(K)) * sum_sqrt_p
-            
-            # Ensure argument to arccos is within [-1, 1] due to floating point error
-            cosine_term = np.clip(cosine_term, -1.0, 1.0)
-            
-            # 2. Calculate UFR_l = (2 / pi) * arccos(cosine_term)
-            distance = (2.0 / math.pi) * math.acos(cosine_term)
-            
-            uncertainties.append(distance)
-            
-        return uncertainties
     def _compute_gap_probs_confidence(self, token_data_list: List[Any]) -> List[float]:
         """Gap between top-1 and top-2 logprobs (Higher value = Higher Confidence)."""
         confidences = []

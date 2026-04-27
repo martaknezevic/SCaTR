@@ -1,20 +1,10 @@
 #!/usr/bin/env python3
-"""
-Train a correctness verifier with LoRA-based parameter-efficient fine-tuning.
-
-Approach – next-token prediction on classification tokens:
-  User  :  Problem + generated answer + "Is this answer correct?"
-  Asst  :  "true" | "false"
-
-Cross-entropy loss is computed **only** on the "true"/"false" assistant tokens
-via label masking (labels=-100 for all prompt tokens).  At eval time the model
-scores each rollout by P("true") and we pick the best-of-N.
-"""
-
 import argparse
+from html import parser
 import json
 import math
 import os
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,14 +18,18 @@ from datasets import Dataset as HFDataset
 from collections import defaultdict
 from tqdm import tqdm
 from peft import LoraConfig, get_peft_model, PeftModel
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from data_utils import split_train_val
 from profiler import FlopsTimingCallback
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-DATA_DIR = None  # Set via command-line argument
+from math_evaluator import MATHLoader, AIMELoader
+
+DATA_DIR = "<path_to_generated_data>"
+
+os.environ["WANDB_PROJECT"] = ''
+os.environ['WANDB_API_KEY'] = ''
 
 
-# ── ChatML fallback (for tokenizers without a built-in chat template) ─────────
 CHATML_TEMPLATE = (
     "{% for message in messages %}"
     "<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n"
@@ -43,6 +37,47 @@ CHATML_TEMPLATE = (
     "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
 )
 
+def seed_everywhere(seed):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        
+def cleanup_model(*models):
+    """Aggressively free GPU memory."""
+    for m in models:
+        if m is not None:
+            m.cpu()
+            del m
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    print(f"GPU memory after cleanup: {torch.cuda.memory_allocated()/1e9:.1f}GB / {torch.cuda.memory_reserved()/1e9:.1f}GB reserved")
+    
+def split_train_val(data, seed, val_ratio=0.25):
+    """
+    Split a list of JSON objects into train and validation sets based on unique problem_ids.
+    Each object must contain a 'problem_id' field. - Function adapted from code in scatr that takes df.
+    """
+    seed_everywhere(seed)
+
+    # Extract unique problem_ids
+    problem_ids = sorted(np.array(list({item['problem_id'] for item in data})))
+    
+    # Shuffle safely
+    shuffled_ids = np.random.permutation(problem_ids)
+
+    # Split
+    val_size = int(len(shuffled_ids) * val_ratio)
+    val_problem_ids = set(shuffled_ids[:val_size])
+    train_problem_ids = set(shuffled_ids[val_size:])
+
+    # Filter data
+    train_data = [item for item in data if item['problem_id'] in train_problem_ids]
+    val_data = [item for item in data if item['problem_id'] in val_problem_ids]
+
+    return train_data, val_data
 
 def ensure_chat_template(tokenizer):
     """Set ChatML fallback if the tokenizer has no chat template."""
@@ -99,16 +134,36 @@ def load_data(model_name: str, dataset_name: str, turn: int) -> List[Dict]:
     )
     res = load_jsonl(filepath)
 
-    # Resolve dataset paths relative to the repo root (parent of baselines/)
     repo_root = Path(__file__).resolve().parent.parent
 
     dataset_name_to_problems = {
         "humaneval": str(repo_root / "datasets" / "humaneval.jsonl"),
-        "kodcode": str(repo_root / "datasets" / "kodcode_1000.jsonl"),
+        "kodcode":   str(repo_root / "datasets" / "kodcode_1000.jsonl"),
+        "math500":   'HuggingFaceH4/MATH-500',
+        "aime":      'MathArena/aime_2025',
+        "aime24": 'Maxwell-Jia/AIME_2024',
     }
 
-    problems = load_jsonl(dataset_name_to_problems[dataset_name])
-    problem_dict = {p["task_id"]: p["prompt"] for p in problems}
+    problems_path = dataset_name_to_problems[dataset_name]
+
+    # Build problem_dict: problem_id -> problem_text
+    if dataset_name in ("humaneval", "kodcode", "bigcodebench_hard"):
+        problems_raw  = load_jsonl(problems_path)
+        problem_dict = {p["task_id"]: p["prompt"] for p in problems_raw}
+    elif dataset_name == "math500":
+        loader = MATHLoader()
+        math_problems = loader.load(problems_path, split='test')
+        problem_dict = {p.problem_id: p.problem_text for p in math_problems}
+    elif dataset_name == "aime":
+        loader = AIMELoader()
+        aime_problems = loader.load(problems_path, split='train')
+        problem_dict = {p.problem_id: p.problem_text for p in aime_problems}
+    elif dataset_name == "aime24":
+        loader = AIMELoader()
+        aime24_problems = loader.load(problems_path, split='train')
+        problem_dict = {p.problem_id: p.problem_text for p in aime24_problems}
+    else:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
 
     for item in res:
         problem_id = item["problem_id"]
@@ -122,9 +177,10 @@ def load_data(model_name: str, dataset_name: str, turn: int) -> List[Dict]:
 # ── chat-formatted dataset ───────────────────────────────────────────────────
 
 USER_TEMPLATE = (
+    "Determine the correctness of the following answer:\n"
     "Problem: {problem}\n"
     "Answer: {response_text}\n"
-    "Is this answer correct? Respond with true or false."
+    "Is this answer correct (yes/no)?"
 )
 
 
@@ -134,19 +190,26 @@ def build_tokenized_dataset(
     """
     Build a HuggingFace Dataset with ``input_ids``, ``attention_mask``, and
     ``labels`` columns.  Labels are -100 for all prompt tokens so loss is only
-    computed on the assistant's "true"/"false" response.
+    computed on the assistant's "yes"/"no" response.
     """
     all_input_ids, all_attn, all_labels = [], [], []
 
     for item in data:
-        label_text = "true" if item["is_correct"] else "false"
+        label_text = "yes" if item["is_correct"] else "no"
         
         response_text_ids = tokenizer.encode(item["response_text"], add_special_tokens=False)
         if len(response_text_ids) > max_seq_len:
             response_text = tokenizer.decode(response_text_ids[-max_seq_len:], skip_special_tokens=True)
         else:
             response_text = item["response_text"]
-        
+            
+        if 'gpt' in tokenizer.name_or_path.lower():
+            response_text = response_text.replace('<|channel|>final<|message|>', '')  # remove any existing generation prompts to avoid duplication        
+            response_text = response_text.replace('<|start|>assistant<|channel|>', '').replace('<|channel|>analysis<|message|>', '')  # remove any existing assistant/analysis tags to avoid duplication
+            # remove any <|text|> wehre text is anything (e.g. <|analysis|>, <|final|>, <|message|>, etc.)
+            import re
+            response_text = re.sub(r'<\|.*?\|>', '', response_text)
+            
         user_content = USER_TEMPLATE.format(
             problem=item["problem"],
             response_text=response_text, 
@@ -166,8 +229,6 @@ def build_tokenized_dataset(
             tokenize=False, add_generation_prompt=False
         )
         
-        full_text = full_text.replace('assistant\n<think>\n\n</think>\n', f'assistant') # remove thinking tags
-
         prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
         full_ids = tokenizer.encode(full_text, add_special_tokens=False)
 
@@ -185,7 +246,6 @@ def build_tokenized_dataset(
         {"input_ids": all_input_ids, "attention_mask": all_attn, "labels": all_labels}
     )
 
-
 # ── training ──────────────────────────────────────────────────────────────────
 
 def train_model(
@@ -196,6 +256,8 @@ def train_model(
     seed: int,
     bs: int = 1,
     grad_accumulation_steps: int = 16,
+    max_seq_len: int = 16384,
+    train_ds: str = None,
 ) -> str:
     """Fine-tune with Trainer.  Loss only on the assistant token."""
 
@@ -206,7 +268,7 @@ def train_model(
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"  # match left-pad in collator
+    tokenizer.padding_side = "right" 
     ensure_chat_template(tokenizer)
 
     # ── model ──
@@ -220,7 +282,7 @@ def train_model(
     lora_config = LoraConfig(
         r=16,  # rank
         lora_alpha=32,  # scaling factor
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj", 'gate_up_proj'],
         lora_dropout=0.05,
         bias="none",
         task_type="CAUSAL_LM",
@@ -228,17 +290,27 @@ def train_model(
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
     
+    print(model)  # look for lora_A / lora_B in the tree
+
+    # First, inspect what's inside the experts
+    for name, module in model.named_modules():
+        if 'expert' in name.lower() or 'mlp' in name.lower():
+            print(f"{name}: {type(module).__name__}")
+    # Check what parameters (leaf tensors) live inside experts
+    for name, param in model.named_parameters():
+        if 'mlp' in name:
+            print(f"{name}: {param.shape}")
     flops_callback = FlopsTimingCallback(model, output_dir=output_dir, profile_step=5)
 
     # Log token info
-    true_ids = tokenizer.encode("true", add_special_tokens=False)
-    false_ids = tokenizer.encode("false", add_special_tokens=False)
-    print(f"'true'  token ids: {true_ids}")
-    print(f"'false' token ids: {false_ids}")
+    true_ids = tokenizer.encode("yes", add_special_tokens=False)
+    false_ids = tokenizer.encode("no", add_special_tokens=False)
+    print(f"'yes'  token ids: {true_ids}")
+    print(f"'no' token ids: {false_ids}")
 
     # ── dataset (pre-tokenized with label masking) ──
-    dataset = build_tokenized_dataset(train_data, tokenizer, max_seq_len=16384)
-    val_dataset = build_tokenized_dataset(val_data, tokenizer, max_seq_len=16384)
+    dataset = build_tokenized_dataset(train_data, tokenizer, max_seq_len=max_seq_len)
+    val_dataset = build_tokenized_dataset(val_data, tokenizer, max_seq_len=max_seq_len)
     print(f"Training examples: {len(dataset)}, Validation examples: {len(val_dataset)}")
     # Show a decoded sample so we can verify formatting
     sample_ids = dataset[0]["input_ids"]
@@ -252,17 +324,12 @@ def train_model(
     #get max sequence length from train data
     max_seq_len = max(len(f["input_ids"]) for f in dataset)
     print(f"Max sequence length in training data: {max_seq_len}")
-    
-    # Measure FLOPs with a sample batch for accurate profiling
-    sample_input_ids = torch.tensor([dataset[0]["input_ids"]], device=model.device)
-    sample_attention_mask = torch.tensor([dataset[0]["attention_mask"]], device=model.device)
-    flops_callback.measure_with_sample(sample_input_ids, sample_attention_mask)
 
     # ── compute expected steps for user info ── 
     num_examples = len(dataset)
     batch_size = bs
     grad_accum = grad_accumulation_steps
-    num_epochs = 1
+    num_epochs = 1 if train_ds != 'aime' else 6  # train longer on the smaller AIME dataset
     steps_per_epoch = math.ceil(num_examples / batch_size) // grad_accum
     total_steps = steps_per_epoch * num_epochs
     print(f"\n{'─' * 50}")
@@ -292,7 +359,7 @@ def train_model(
         #metric_for_best_model="eval_loss",
         bf16=True,
         seed=seed,
-        report_to="none",
+        report_to="wandb",
         remove_unused_columns=False,
         disable_tqdm=False,
     )
@@ -306,6 +373,12 @@ def train_model(
         data_collator=collator,
         callbacks=[flops_callback]
     )
+    
+    # After building dataset, before trainer.train()
+    sample = dataset[0]
+    sample_ids = torch.tensor([sample["input_ids"]]).to(model.device)
+    sample_mask = torch.tensor([sample["attention_mask"]]).to(model.device)
+    flops_callback.measure_with_sample(sample_ids, sample_mask)
 
     trainer.train()
     print(f"\nTraining complete. Saving final model to {output_dir}")
@@ -328,43 +401,61 @@ def train_model(
 
 def evaluate_best_of_n(
     hf_model, model_dir: str, test_data: List[Dict], gpu_id: int,
-    batch_size: int = 32,
+    batch_size: int = 32, max_seq_len: int = 16384
 ) -> float:
-    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    
+    test_data = test_data[:100]  # TEMP: limit to 100 samples for faster evaluation during development
+    
+    print(f"Evaluating best-of-N on GPU {gpu_id} with model {model_dir}...")
+    print(f"Model: {model_dir}")
+    tokenizer = AutoTokenizer.from_pretrained(hf_model)
     tokenizer.padding_side = "left"  # critical for causal LM batching
     ensure_chat_template(tokenizer)
-
     base_model = AutoModelForCausalLM.from_pretrained(
         hf_model, torch_dtype=torch.bfloat16, device_map="auto",
     )
+    print(f"Base model {hf_model} loaded for evaluation.")
     model = PeftModel.from_pretrained(base_model, model_dir)
     model.eval()
 
-    true_token_id = tokenizer.encode("true", add_special_tokens=False)[0]
-    false_token_id = tokenizer.encode("false", add_special_tokens=False)[0]
+    true_token_id = tokenizer.encode("yes", add_special_tokens=False)[0]
+    false_token_id = tokenizer.encode("no", add_special_tokens=False)[0]
 
     # ── build ALL prompts upfront ──────────────────────────────────────────
     all_prompts = []
     all_items   = []
     for item in test_data:
+        response_text_ids = tokenizer.encode(item["response_text"], add_special_tokens=False)
+        if len(response_text_ids) > max_seq_len:
+            response_text = tokenizer.decode(response_text_ids[-max_seq_len:], skip_special_tokens=True)
+        else:
+            response_text = item["response_text"]
+            
         messages = [{"role": "user", "content": USER_TEMPLATE.format(
             problem=item["problem"],
-            response_text=item["response_text"],
+            response_text=response_text,
         )}]
+        
         prompt = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
+        
+        if 'qwen' in hf_model.lower():
+            prompt += '<think>\n\n</think>\n\n'
         
         if 'gpt' in hf_model.lower():
             prompt += '<|channel|>final<|message|>'
         
         all_prompts.append(prompt)
         all_items.append(item)
-
+    print(f"Built {len(all_prompts)} prompts for evaluation.")
     # ── batched forward passes ─────────────────────────────────────────────
     all_true_probs  = []
     all_false_probs = []
 
+    import time
+    infer_times = []
+    start_time = time.time() 
     with torch.no_grad():
         for i in tqdm(range(0, len(all_prompts), batch_size), desc="Evaluating"):
             batch_prompts = all_prompts[i : i + batch_size]
@@ -377,25 +468,44 @@ def evaluate_best_of_n(
             ).to(model.device)
 
             # logits[:, -1, :] = next-token distribution for every item in batch
+            start_infer = time.time()
             logits = model(**inputs).logits[:, -1, :]
             probs  = torch.softmax(logits, dim=-1)
-
+            end_infer = time.time()
+            infer_times.append(end_infer - start_infer)
+            
             all_true_probs.extend(probs[:, true_token_id].cpu().tolist())
             all_false_probs.extend(probs[:, false_token_id].cpu().tolist())
+    end_time = time.time()
+    print(f"Completed forward passes for evaluation. Collected probabilities for {len(all_true_probs)} samples.")
+    print(f"Total evaluation time: {end_time - start_time:.2f} seconds")
+    print(f"Average inference time per sample: {sum(infer_times) / len(infer_times):.4f} seconds")
+    # ── per-rollout predictions ────────────────────────────────────────────
+    rollout_predictions = []
+    for idx, item in enumerate(all_items):
+        rollout_predictions.append({
+            "problem_id":      item["problem_id"],
+            "rollout_idx":     item.get("rollout_idx", idx),
+            "true_prob":       all_true_probs[idx],
+            "false_prob":      all_false_probs[idx],
+            "predicted_label": "yes" if all_true_probs[idx] > all_false_probs[idx] else "no",
+            "is_correct":      item["is_correct"],
+        })
 
     # ── best-of-N selection ────────────────────────────────────────────────
-    # Re-group by problem_id using indices
     problems = defaultdict(list)
     for idx, item in enumerate(all_items):
         problems[item["problem_id"]].append({
-            "rollout":    item,
-            "true_prob":  all_true_probs[idx],
-            "false_prob": all_false_probs[idx],
+            "rollout":         item,
+            "rollout_idx":     item.get("rollout_idx", idx),
+            "true_prob":       all_true_probs[idx],
+            "false_prob":      all_false_probs[idx],
             "predicted_token": true_token_id if all_true_probs[idx] > all_false_probs[idx] else false_token_id,
         })
 
     correct_predictions = 0
     total_problems      = 0
+    problem_results     = []
     for problem_id, rollout_scores in problems.items():
         true_preds = [r for r in rollout_scores if r["predicted_token"] == true_token_id]
         if true_preds:
@@ -403,20 +513,36 @@ def evaluate_best_of_n(
         else:
             best = min(rollout_scores, key=lambda x: x["false_prob"])
 
-        if best["rollout"]["is_correct"]:
+        is_correct = best["rollout"]["is_correct"]
+        if is_correct:
             correct_predictions += 1
         total_problems += 1
 
-    print(f"\nEvaluation complete. {correct_predictions}/{total_problems} = {correct_predictions/total_problems:.2%}")
-    return correct_predictions / total_problems if total_problems > 0 else 0.0
+        problem_results.append({
+            "problem_id":      problem_id,
+            "best_rollout_idx": best["rollout_idx"],
+            "best_true_prob":  best["true_prob"],
+            "best_false_prob": best["false_prob"],
+            "predicted_label": "yes" if best["predicted_token"] == true_token_id else "no",
+            "is_correct":      is_correct,
+            "n_rollouts":      len(rollout_scores),
+        })
 
+    accuracy = correct_predictions / total_problems if total_problems > 0 else 0.0
+    print(f"\nEvaluation complete. {correct_predictions}/{total_problems} = {accuracy:.2%}")
+
+    # ── cleanup ───────────────────────────────────────────────────────────
+    cleanup_model(model, base_model)
+    del tokenizer
+
+    return accuracy, rollout_predictions, problem_results, end_time - start_time, infer_times
 
 # ── per-seed entry-point ─────────────────────────────────────────────────────
 
 def process_seed(args_tuple):
     """Process a single (seed, turn) experiment."""
-    seed, gpu_id, train_ds, test_ds, model_name, hf_model, turn, bs, grad_accumulation_steps = args_tuple
-
+    seed, gpu_id, train_ds, test_ds, model_name, hf_model, turn, bs, bs_eval, grad_accumulation_steps, max_seq_len, eval_only, inference_estimate = args_tuple
+    print(f"Eval: {eval_only}")
     try:
         print(f"\nSeed {seed}, Turn {turn} (GPU {gpu_id}): Starting...")
 
@@ -424,10 +550,8 @@ def process_seed(args_tuple):
         test_data = load_data(model_name, test_ds, turn)
 
         # Split training data into train/val by problem_id
-        train_split, val_split = split_train_val(train_data, val_ratio=0.2, random_seed=seed)
-        ############### FOR NOW ################################
-        train_split = train_data  # TEMP: use all data for training and don't do validation and early stopping
-        #########################################################
+        train_split, val_split = split_train_val(train_data, seed)
+
         print(
             f"Seed {seed}: {len(train_split)} train / {len(val_split)} val / {len(test_data)} test samples"
         )
@@ -444,16 +568,72 @@ def process_seed(args_tuple):
 
         #return seed, None, None  # TEMP: skip training/eval to test data loading and distribution printing
         
-        output_dir = f"./sft_output/{model_name}_{train_ds}_{test_ds}/seed_{seed}_turn{turn}"
-    
-        print(f"Seed {seed}: Training...")
-        model_dir = train_model(train_split, val_split, hf_model, output_dir, seed, bs, grad_accumulation_steps)
+        output_dir = f"/tmp/scatr/models/baselines/{model_name}_{train_ds}_{test_ds}/seed_{seed}_turn{turn}"
+        
+        
 
+        if eval_only:
+            print(f"Seed {seed}: Eval-only mode, skipping training and using existing model at {output_dir}")
+            model_dir = output_dir
+            print(model_dir)
+        else:
+            print(f"Seed {seed}: Training...")
+            model_dir = train_model(train_split, val_split, hf_model, output_dir, seed, bs, grad_accumulation_steps, max_seq_len=max_seq_len, train_ds=train_ds)
+
+        if inference_estimate:
+            output_dir = f"/tmp/scatr/models/inference_estimates_v2/{model_name}_{train_ds}_{test_ds}/seed_{seed}_turn{turn}"
         print(f"Seed {seed}: Evaluating...")
-        accuracy = evaluate_best_of_n(hf_model, model_dir, test_data, gpu_id, batch_size=bs)
+        import time
+        eval_start_time = time.time()
+        accuracy, rollout_predictions, problem_results, eval_time, infer_times = evaluate_best_of_n(hf_model, model_dir, test_data, gpu_id, batch_size=bs_eval, max_seq_len=max_seq_len)
+        eval_end_time = time.time()
         print(f"Seed {seed}: Accuracy = {accuracy:.4f}")
 
-        return seed, accuracy, None
+        # log dir mirrors the model dir
+        log_dir = Path(output_dir)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        
+        if inference_estimate:
+            # If this is an inference time estimation run, log the timing results instead of accuracy
+            timing_log_path = log_dir / f"inference_timing_seed{seed}_turn{turn}.json"
+            with open(timing_log_path, "w") as f:
+                json.dump({
+                    "model_dir": model_dir,
+                    "train_ds": train_ds,
+                    "test_ds": test_ds,
+                    "seed": seed,
+                    "turn": turn,
+                    "eval_bon_selection": eval_end_time - eval_start_time,
+                    "infer_times_seconds": infer_times,
+                    "eval_time_seconds": eval_time,
+                    
+                }, f, indent=2)
+            print(f"Logged inference timing → {timing_log_path}")
+            return seed, None, None
+
+        # per-rollout probabilities
+        rollout_log_path = log_dir / f"eval_rollouts_seed{seed}_turn{turn}.jsonl"
+        with open(rollout_log_path, "w") as f:
+            for row in rollout_predictions:
+                f.write(json.dumps(row) + "\n")
+
+        # per-problem best-of-N results + overall accuracy
+        results_log_path = log_dir / f"eval_results_seed{seed}_turn{turn}.json"
+        with open(results_log_path, "w") as f:
+            json.dump({
+                "model_dir":   model_dir,
+                "train_ds":    train_ds,
+                "test_ds":     test_ds,
+                "seed":        seed,
+                "turn":        turn,
+                "accuracy":    accuracy,
+                "n_correct":   int(accuracy * len(problem_results)),
+                "n_problems":  len(problem_results),
+                "problems":    problem_results,
+            }, f, indent=2)
+
+        print(f"Logged rollouts → {rollout_log_path}")
+        print(f"Logged results  → {results_log_path}")
     except Exception as e:
         print(f"Seed {seed}: Error – {e}")
         return seed, None, str(e)
@@ -462,32 +642,33 @@ def process_seed(args_tuple):
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main():
-    global DATA_DIR
-    
     parser = argparse.ArgumentParser(
         description="Fine-tune a correctness verifier with LoRA and evaluate best-of-N"
     )
     parser.add_argument("--train", type=str, required=True, help="train dataset name")
     parser.add_argument("--test", type=str, required=True, help="test dataset name")
     parser.add_argument("--model", type=str, default=None, help="model short name or HF id")
-    parser.add_argument("--data-dir", type=str, default="/efs/cactts/data", help="base data directory")
-    parser.add_argument("--num-gpus", type=int, default=1, help="number of GPUs")
     parser.add_argument("--bs", type=int, default=1, help="per-device batch size for training")
-    parser.add_argument("--grad-accum", type=int, default=16, help="gradient accumulation steps for training")
+    parser.add_argument("--bs_eval", type=int, default=16, help="per-device batch size for evaluation")
+    parser.add_argument("--grad_accum", type=int, default=16, help="gradient accumulation steps for training")
+    parser.add_argument("--max_seq_len", type=int, default=16384, help="maximum sequence length for training and evaluation")
+    parser.add_argument("--eval_only", action="store_true", help="skip training and only run evaluation (expects existing model checkpoints)")
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--turn", type=int, default=None)
+    parser.add_argument("--inference_estimate", action="store_true", help="estimate inference time")
     parser.add_argument(
         "--sequential", action="store_true", help="run seeds sequentially"
     )
     args = parser.parse_args()
-    
-    DATA_DIR = args.data_dir
 
-    seeds = [42, 52]
+    seeds = [32, 42, 52]
     turns = [1, 2, 3]
 
     model_mapping = {
         "gptoss": "openai/gpt-oss-20b",
-        "ollmo7b": "allenai/OLMo-2-1124-7B-Instruct",
+        "olmo7b": "allenai/OLMo-2-1124-7B-Instruct",
         "qwen1_7b": "Qwen/Qwen3-1.7B",
+        "qwen30b": "Qwen/Qwen3-30B-A3B"
     }
     args.hf_model = model_mapping.get(args.model, args.model)
 
@@ -495,21 +676,44 @@ def main():
     print(f"Test:  {args.test}")
     print(f"Model: {args.model}  →  {args.hf_model}")
     print(f"Seeds: {seeds}")
-    print(f"GPUs:  {args.num_gpus}")
     print("=" * 70)
+    
+    if args.seed is not None and args.turn is not None:
+        task = (args.seed, 0, args.train, args.test, args.model, args.hf_model,
+                args.turn, args.bs, args.bs_eval, args.grad_accum, args.max_seq_len, args.eval_only, args.inference_estimate)
+        process_seed(task)
+        return
 
     tasks = []
     for idx, seed in enumerate(seeds):
         for turn in turns:
-            gpu_id = idx % args.num_gpus
             tasks.append(
-                (seed, gpu_id, args.train, args.test, args.model, args.hf_model, turn, args.bs, args.grad_accum)
+                (seed, 0, args.train, args.test, args.model, args.hf_model, turn, args.bs, args.bs_eval, args.grad_accum, args.max_seq_len, args.eval_only, args.inference_estimate)
             )
 
     results = []
     if args.sequential:
         for task in tasks:
-            results.append(process_seed(task))
+            seed, gpu_id, train_ds, test_ds, model_name, hf_model, turn, bs, bs_eval, grad_accum, max_seq_len, eval_only, inference_estimate = task
+            
+            cmd = [
+                sys.executable, __file__,
+                "--train", train_ds,
+                "--test", test_ds,
+                "--model", model_name,
+                "--bs", str(bs),
+                "--bs_eval", str(bs_eval),
+                "--grad_accum", str(grad_accum),
+                "--max_seq_len", str(max_seq_len),
+                "--sequential",
+                "--seed", str(seed),
+                "--turn", str(turn),
+            ]
+            if eval_only:
+                cmd.append("--eval_only")
+            
+            print(f"Launching subprocess: seed={seed}, turn={turn}")    
+            subprocess.run(cmd, check=True)
     else:
         import multiprocessing as mp
         mp.set_start_method("spawn", force=True)
@@ -520,51 +724,8 @@ def main():
 
     # ── report ──
     print(f"\n{'=' * 70}")
-    print("RESULTS")
+    print("DONE. Summary of results:")
     print(f"{'=' * 70}")
-
-    accuracies = []
-    for seed, accuracy, error in results:
-        if error:
-            print(f"Seed {seed}: Error – {error}")
-        else:
-            print(f"Seed {seed}: Accuracy = {accuracy:.4f}")
-            accuracies.append(accuracy)
-
-    if accuracies:
-        mean_acc = np.mean(accuracies)
-        std_acc = np.std(accuracies)
-
-        print(f"\n{'=' * 70}")
-        print("FINAL RESULTS")
-        print(f"{'=' * 70}")
-        print(f"Best-of-N Accuracy: {mean_acc:.4f} ± {std_acc:.4f}")
-        print(f"Total experiments: {len(accuracies)}")
-
-        train_name = Path(args.train).stem
-        test_name = Path(args.test).stem
-        output_file = f"results_sft_{train_name}_{test_name}.txt"
-
-        with open(output_file, "w") as f:
-            f.write("LoRA-based Correctness-Verifier Results\n")
-            f.write(f"{'=' * 70}\n")
-            f.write(f"Train: {args.train}\n")
-            f.write(f"Test:  {args.test}\n")
-            f.write(f"Model: {args.hf_model}\n")
-            f.write(f"Seeds: {seeds}\n\n")
-            f.write(f"Best-of-N Accuracy: {mean_acc:.4f} ± {std_acc:.4f}\n")
-            f.write(f"\nIndividual results:\n")
-            for seed, accuracy, error in results:
-                if error:
-                    f.write(f"  Seed {seed}: Error – {error}\n")
-                else:
-                    f.write(f"  Seed {seed}: {accuracy:.4f}\n")
-            f.write(f"{'=' * 70}\n")
-
-        print(f"\nResults saved to {output_file}")
-    else:
-        print("\nNo successful experiments completed.")
-
 
 if __name__ == "__main__":
     main()

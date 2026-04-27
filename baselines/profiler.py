@@ -96,6 +96,7 @@ class FlopsTimingCallback(TrainerCallback):
         self.measured_seq_len = seq_len
 
         forward_flops = measure_forward_flops(self.model, input_ids, attention_mask)
+        print(f"Measured forward FLOPs for batch {batch_size} × {seq_len}: {forward_flops:,}" if forward_flops else "Using theoretical FLOPs estimate")
 
         if forward_flops is not None:
             total_tokens = batch_size * seq_len

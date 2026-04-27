@@ -1,19 +1,16 @@
 """
 Modular Math Evaluation Framework
 
-A flexible, configuration-driven evaluation system for mathematical reasoning datasets.
-Supports AIME, MATH, GSM8K, and custom datasets through pluggable components.
+Supports AIME, MATH, and custom datasets through pluggable components.
 
 Key Features:
 - Abstract base classes for dataset loaders, answer extractors, and graders
 - Factory pattern for component instantiation from config
 - Configuration-driven (YAML) with all parameters externalized
-- Same generation functions as original cactts_aime25.py
-- Clean separation of concerns with modular architecture
 
 Usage:
-    python math_evaluator.py --config config_aime.yaml
-    python math_evaluator.py --config config_math.yaml --n_gen 20
+    python math_evaluator.py --config configs/config_aime.yaml
+    python math_evaluator.py --config configs/config_math.yaml --n_gen 20
 """
 
 import time
@@ -25,12 +22,11 @@ import random
 import re
 import yaml
 import os
-from typing import List, Dict, Any, Tuple, Optional, Union
-from dataclasses import dataclass, asdict
-from pathlib import Path
+from typing import List, Dict, Any, Optional, Union
+from dataclasses import dataclass
 from abc import ABC, abstractmethod
 from concurrent.futures import ProcessPoolExecutor
-from openai.types.chat import ChatCompletion, ChatCompletionMessage
+from openai.types.chat import ChatCompletionMessage
 from openai.types.chat.chat_completion import Choice, ChoiceLogprobs
 import argparse
 
@@ -47,7 +43,6 @@ except ImportError:
 
 try:
     from grading.grader import grade_answer
-    from grading.normalize import normalize_answer
     GRADING_AVAILABLE = True
 except ImportError:
     GRADING_AVAILABLE = False
@@ -188,9 +183,9 @@ class AIMELoader(DatasetLoader):
                 
                 problems = []
                 for i, item in enumerate(dataset):
-                    problem_text = self._extract_field(item, ['problem', 'question', 'text'])
-                    answer = self._extract_field(item, ['answer', 'solution'])
-                    problem_id = self._extract_field(item, ['id', 'problem_id'], default=f"aime_{i}")
+                    problem_text = self._extract_field(item, ['problem', 'question', 'text', 'Problem'])
+                    answer = self._extract_field(item, ['answer', 'solution', 'Answer'])
+                    problem_id = self._extract_field(item, ['id', 'problem_id', 'ID'], default=f"aime_{i}")
                     
                     if problem_text is None or answer is None:
                         continue
@@ -344,87 +339,6 @@ class MATHLoader(DatasetLoader):
         return default
 
 
-class GSM8KLoader(DatasetLoader):
-    """Loader for GSM8K dataset"""
-    
-    def get_name(self) -> str:
-        return "GSM8K"
-    
-    def load(self, dataset_source: str, split: str = "test", **kwargs) -> List[MathProblem]:
-        """Load GSM8K dataset"""
-        
-        if HF_AVAILABLE:
-            try:
-                print(f"Loading GSM8K dataset from HuggingFace: {dataset_source}")
-                dataset = load_dataset(dataset_source, 'main', split=split).shuffle(seed=42).select(range(1000))
-                
-                problems = []
-                for i, item in enumerate(dataset):
-                    question = item.get('question')
-                    answer = item.get('answer')
-                    
-                    if question is None or answer is None:
-                        continue
-                    
-                    # Extract numeric answer from "#### 123" format
-                    if '####' in str(answer):
-                        answer_match = re.search(r'####\s*([0-9,.-]+)', str(answer))
-                        if answer_match:
-                            answer = answer_match.group(1).replace(',', '')
-                    
-                    problems.append(MathProblem(
-                        problem_id=f"gsm8k_{i}",
-                        problem_text=str(question),
-                        answer=str(answer),
-                        metadata={'index': i}
-                    ))
-                
-                print(f"Loaded {len(problems)} GSM8K problems")
-                return problems
-                
-            except Exception as e:
-                print(f"Failed to load GSM8K dataset: {e}")
-        
-        # Try local JSON or JSONL
-        if dataset_source.endswith(('.json', '.jsonl')):
-            problems = []
-            
-            if dataset_source.endswith('.jsonl'):
-                # Load JSONL (one JSON object per line)
-                with open(dataset_source, 'r') as f:
-                    data = [json.loads(line) for line in f]
-            else:
-                # Load JSON
-                with open(dataset_source, 'r') as f:
-                    data = json.load(f)
-            
-            for i, item in enumerate(data):
-                question = item.get('question', item.get('problem'))
-                answer = item.get('answer')
-                
-                if question is None or answer is None:
-                    continue
-                
-                # Extract numeric answer from "#### 123" format if present
-                if '####' in str(answer):
-                    answer_match = re.search(r'####\s*([0-9,.-]+)', str(answer))
-                    if answer_match:
-                        answer = answer_match.group(1).replace(',', '')
-                
-                problems.append(MathProblem(
-                    problem_id=item.get('id', item.get('problem_id', f"gsm8k_{i}")),
-                    problem_text=str(question),
-                    answer=str(answer),
-                    metadata={'index': i}
-                ))
-            
-            file_type = "JSONL" if dataset_source.endswith('.jsonl') else "JSON"
-            print(f"Loaded {len(problems)} GSM8K problems from {file_type}")
-            return problems
-        
-        raise ValueError("HuggingFace datasets not available")
-
-
 class GenericLoader(DatasetLoader):
     """Generic loader for custom datasets"""
     
@@ -515,33 +429,6 @@ class MATHExtractor(AnswerExtractor):
             matches = re.findall(pattern, response_text.lower(), re.MULTILINE)
             if matches:
                 return matches[-1].strip()
-        
-        return None
-
-
-class GSM8KExtractor(AnswerExtractor):
-    """Extractor for GSM8K numeric answers"""
-    
-    def get_name(self) -> str:
-        return "GSM8K"
-    
-    def extract(self, response_text: str) -> Optional[str]:
-        """Extract numeric answer (with decimals, commas, negatives)"""
-        if not response_text:
-            return None
-        
-        patterns = [
-            r'####\s*([-+]?[0-9,]+\.?[0-9]*)',  # GSM8K format
-            r'(?:answer|result|solution)(?:\s+is)?\s*[:\=]?\s*([-+]?[0-9,]+\.?[0-9]*)',
-            r'(?:equals?|is)\s+([-+]?[0-9,]+\.?[0-9]*)',
-            r'([-+]?[0-9,]+\.?[0-9]*)(?:\s*$)',
-        ]
-        
-        for pattern in patterns:
-            matches = re.findall(pattern, response_text, re.MULTILINE)
-            if matches:
-                answer = matches[-1].strip().replace(',', '')
-                return answer
         
         return None
 
@@ -650,7 +537,6 @@ class LoaderFactory:
     _loaders = {
         'aime': AIMELoader,
         'math': MATHLoader,
-        'gsm8k': GSM8KLoader,
         'generic': GenericLoader,
     }
     
@@ -674,7 +560,6 @@ class ExtractorFactory:
     _extractors = {
         'aime': AIMEExtractor,
         'math': MATHExtractor,
-        'gsm8k': GSM8KExtractor,
         'generic': GenericExtractor,
     }
     

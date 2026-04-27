@@ -8,8 +8,8 @@ do
     echo "========================================="
     
     python math_evaluator.py \
-        --config config_math.yaml \
-        --output_dir "/efs/cactts/data/qwen1_7b/math500/turn${i}" \
+        --config configs/config_math.yaml \
+        --output_dir "/tmp/scatr/data/qwen1_7b/math500/turn${i}" \
         --temperature 0.6 \
         --base_url "http://localhost:8000/v1"
     
@@ -19,8 +19,8 @@ do
     fi
 
     python math_evaluator.py \
-        --config config_aime.yaml \
-        --output_dir "/efs/cactts/data/qwen1_7b/aime/turn${i}" \
+        --config configs/config_aime.yaml \
+        --output_dir "/tmp/scatr/data/qwen1_7b/aime/turn${i}" \
         --temperature 0.6 \
         --base_url "http://localhost:8000/v1"   
     
@@ -28,12 +28,5 @@ do
         echo "Error: Evaluation failed on aime turn $i"
         exit 1
     fi
-    
-    echo ""
-    echo "Turn $i completed successfully"
-    echo ""
 done
 
-echo "========================================="
-echo "All 3 evaluation turns completed!"
-echo "========================================="

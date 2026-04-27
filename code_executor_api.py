@@ -11,7 +11,7 @@ import time
 from executor.safe_executor import PyExecutor
 from executor.code_contests_executor import ContestExecutor
 
-EXECUTOR_TYPE = os.getenv("EXECUTOR_TYPE", "kodcode")
+EXECUTOR_TYPE = os.getenv("EXECUTOR_TYPE", "code_contests")
 print("\n" + "=" * 60)
 print("🚀 EXECUTOR API STARTUP")
 print("=" * 60)
@@ -48,7 +48,6 @@ class ExecutionRequest(BaseModel):
 
 class ExecutionResponse(BaseModel):
     is_passing: bool
-    feedback: str
     partial_test_cases: List[float]
 
 
@@ -69,14 +68,11 @@ def execute_code(req: ExecutionRequest):
 
         # Fix 3: Extract values from the ExecuteResult object
         is_passing = result.is_passing
-        feedback = result.feedback
         code = req.code
         
-        #print("="*100)
-        #print(code)
-        #print()
-        #print(result.feedback)
-        #print("="*100)
+        print("="*100)
+        print(code)
+        print("="*100)
 
         # Fix 4: Convert boolean state to float partial scores (1.0 for pass, 0.0 for fail)
         partial = [1.0 if test_passed else 0.0 for test_passed in result.state]
@@ -84,12 +80,12 @@ def execute_code(req: ExecutionRequest):
         del exe
 
         return ExecutionResponse(
-            is_passing=is_passing, feedback=feedback, partial_test_cases=partial
+            is_passing=is_passing, partial_test_cases=partial
         )
     except Exception as e:
-        #print("=" * 100)
-        #print("Execution Error:")
-        #print(e)
-        #print("=" * 100)
+        print("=" * 100)
+        print("Execution Error:")
+        print(e)
+        print("=" * 100)
         logger.exception("Execution error")
         raise HTTPException(status_code=500, detail=f"Execution error: {e}")

@@ -1,5 +1,5 @@
 """
-https://github.com/StigLidu/TURN/blob/main/MATH/math_utils/math_normalize.py
+Taken and adapted from https://github.com/StigLidu/TURN/blob/main/MATH/math_utils/math_normalize.py
 """
 import re
 from typing import Optional
